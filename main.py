@@ -47,23 +47,62 @@ def main():
             state={"x": float(xs[i]), "y": float(ys[i]), "theta": float(thetas[i]), "v": 0.0, "w": 0.0},
         )
         robots.append(r)
+        
+    print("[info] Sampled initial robot states:")
 
-    # 3) Instantiate the (placeholder) game solver
+    # 3) Instantiate and wire the game solver
     gs = GameSolver(
         params={
             "N": N,
             "dt": 0.1,
             "T": 20,
-            "weights": {"w_goal": 1.0, "w_collision": 10.0, "w_control": 0.1},
+            "weights": {"w_goal": 1.0, "w_collision": 10.0, "w_control": 0.1, "w_terminal": 1.0},
             "radius": radius_val,
+            # 关键：把环境与机器人交给 GameSolver，g(目标)从 env 提供
+            "environment": env,
+            "robots": robots,
+            "g": np.asarray(env.goals, dtype=float),
+            # 可选：初始控制不提供则自动置零
+            # 可选：若有分配模型或固定P，可加：
+            # "assignment_model": your_assignment_model,
+            # "P": your_fixed_P,  # (N,N)
+            # 可选：迭代参数
+            "num_iters": 100,
+            "step_size": 1e-2,
         }
     )
-    # gs.construct_game()  # placeholder
-    # gs.solve_game()      # placeholder
+    
+    print("[info] Starting construct the game...")
 
-    # 4) Visualize the scene (robots, headings, goals, bounds)
+    # 4) Build and solve the game
+    gs.construct_game()
+    
+    print("[info] Trying to solve the game...")
+    try:
+        gs.solve_game()
+    except RuntimeError as e:
+        print(f"[WARN] solve_game failed: {e}")
+        visualize_scene(robots, env)
+        return
+
+    # 5) 将求解得到的终点状态写回 robots，用于可视化
+    sol = gs.solution
+    x_traj_list = sol["x_traj_list"]
+    # 因为是 unicycle/bicycle 的最简状态映射：x=[x,y,theta]
+    for i in range(N):
+        x_T = np.array(x_traj_list[i][-1])
+        robots[i].set_state(x=float(x_T[0]), y=float(x_T[1]), theta=float(x_T[2]))
+
+    # 6) 可视化（显示最终位置与目标）
     visualize_scene(robots, env)
 
-
+    # （可选）打印分配信息
+    hat_g = sol.get("hat_g", None)
+    P = sol.get("P", None)
+    if hat_g is not None:
+        print("[info] hat_g (assigned goals) shape:", np.asarray(hat_g).shape)
+    if P is not None:
+        print("[info] P provided by assignment_model with shape:", np.asarray(P).shape)
+        
 if __name__ == "__main__":
     main()
