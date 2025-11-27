@@ -7,6 +7,7 @@ from environment import Environment
 from lqrax import iLQR
 import numpy as np
 import jax
+import jax.nn as jnn
 import jax.numpy as jnp
 from jax import jit, vmap, grad
 @dataclass
@@ -239,7 +240,7 @@ class GameSolver:
 
         # --- 5) Build smooth runtime and terminal losses (JAX-friendly) ---
         def _softplus(x, alpha=20.0):
-            return jnp.log1p(jnp.exp(alpha * x)) / alpha
+            return jnn.softplus(alpha * x) / alpha
 
         def psi_dist(d):
             # smooth (r - d)_+
@@ -250,23 +251,37 @@ class GameSolver:
             w_collision = float(w.get("w_collision", 10.0))
             w_control = float(w.get("w_control", 0.1))
 
+            def safe_norm(x, axis=-1, eps=1e-6):
+                # sqrt(sum(x^2) + eps) ：在 0 处梯度为 0，不会 NaN
+                return jnp.sqrt(jnp.sum(x * x, axis=axis) + eps)
+
             def rt(x_i_t, u_i_t, x_all_t):
-            # x_all_t 是 list[(x_dim,)], 我们把它堆成 (N, x_dim)
-                x_all_t_arr = jnp.stack(x_all_t, axis=0)
+                # 只堆位置，避免不同 x_dim 的影响
+                pos_all = jnp.stack([x[:2] for x in x_all_t], axis=0)  # (N,2)
+                x_i_xy = x_i_t[:2]
 
-                goal_term = w_goal * jnp.sum((x_i_t[:2] - hat_g[i]) ** 2)
+                goal_term = w_goal * jnp.sum((x_i_xy - hat_g[i]) ** 2)
 
-                # pairwise distances (N,)
-                dists = jnp.linalg.norm(x_all_t_arr[:, :2] - x_i_t[:2], axis=1)
-                # 屏蔽自己
-                mask = 1.0 - jnp.eye(N)[i]
-                # 平滑惩罚
+                # pairwise diffs
+                diffs = pos_all - x_i_xy  # (N,2)
+
+                # （可选）把自项差分改成 0，或改成一个与 x_i 独立的常数向量
+                diffs = diffs.at[i].set(jnp.array([0.0, 0.0]))
+
+                # 安全范数（含 eps），不会在 0 处产生 NaN 梯度
+                dists = safe_norm(diffs, axis=1)  # (N,)
+
+                # mask 自项
+                mask = jnp.ones((N,), dtype=dists.dtype).at[i].set(0.0)
+
                 coll_sum = jnp.sum(mask * psi_dist(dists))
                 coll_term = w_collision * coll_sum
 
                 ctrl_term = w_control * jnp.sum(u_i_t ** 2)
                 return goal_term + coll_term + ctrl_term
+
             return rt
+
 
         runtime_losses = [make_runtime_loss(i) for i in range(N)]
 
@@ -305,7 +320,7 @@ class GameSolver:
                         return jnp.array([v * jnp.cos(theta), v * jnp.sin(theta), w])
 
                 ilqr_agents.append(UniAgent(dt=dt, x_dim=3, u_dim=2,
-                                            Q=jnp.eye(3)*1e-6, R=jnp.eye(2)*1e-6))
+                                            Q=jnp.eye(3)*1e-2, R=jnp.eye(2)*1e-2))
 
             elif stype == "bicycle":
                 L = float(rb.params["wheelbase"])
@@ -322,7 +337,7 @@ class GameSolver:
                         return jnp.array([dx, dy, dtheta])
 
                 ilqr_agents.append(BikeAgent(dt=dt, x_dim=3, u_dim=2,
-                                            Q=jnp.eye(3)*1e-6, R=jnp.eye(2)*1e-6))
+                                            Q=jnp.eye(3)*1e-2, R=jnp.eye(2)*1e-2))
 
             elif stype == "double-integrator":
                 a_max = float(rb.params["max_accel"])
@@ -337,7 +352,7 @@ class GameSolver:
                         return jnp.array([xt[2], xt[3], ax, ay])
 
                 ilqr_agents.append(DI2DAgent(dt=dt, x_dim=4, u_dim=2,
-                                            Q=jnp.eye(4)*1e-6, R=jnp.eye(2)*1e-6))
+                                            Q=jnp.eye(4)*1e-2, R=jnp.eye(2)*1e-2))
             else:
                 raise ValueError(f"Unknown steering_type {stype}")
 
@@ -373,6 +388,7 @@ class GameSolver:
             - P: if assignment_model exposes P(), include it; else None
             - params: echo of self.params for reproducibility
         """
+
         if self.game_model is None:
             raise RuntimeError("Please call construct_game() first.")
 
@@ -387,6 +403,20 @@ class GameSolver:
         terminal_loss = gm["terminal_loss"]
         rollout_agent = gm["rollout_agent"]
         hat_g = gm["hat_g"]
+        
+        print("[DEBUG] Initial x0_list:")
+        for i, x0 in enumerate(x0_list):
+            print(f"  Robot {i}:", x0,
+                "  has_nan=", bool(jnp.isnan(x0).any()),
+                "  has_inf=", bool(jnp.isinf(x0).any()))
+
+        print("[DEBUG] Initial u_traj_list stats (per agent):")
+        for i, U in enumerate(u_traj_list):
+            print(f"  Agent {i}: shape={tuple(U.shape)}, "
+                f"mean={float(jnp.nanmean(U)):.6f}, "
+                f"std={float(jnp.nanstd(U)):.6f}, "
+                f"has_nan={bool(jnp.isnan(U).any())}, "
+                f"has_inf={bool(jnp.isinf(U).any())}")
 
         # --- helpers ---
         def rollout_all(x0L, uL):
@@ -394,6 +424,41 @@ class GameSolver:
 
         # initial rollout
         x_traj_list = rollout_all(x0_list, u_traj_list)
+        
+        # === PRE-GRAD DIAGNOSTIC: check rollout & raw loss ===
+        for i, xt in enumerate(x_traj_list):
+            if jnp.isnan(xt).any() or jnp.isinf(xt).any():
+                bad = jnp.argwhere(jnp.isnan(xt) | jnp.isinf(xt))
+                print(f"[NaN/Inf] rollout x_traj_list[{i}] bad indices (t, dim):", bad)
+
+        # Check runtime loss without grad
+        _any_nan_loss = False
+        for i in range(N):
+            rt = runtime_losses[i]
+            for t in range(T):
+                x_all_t = [x_traj_list[k][t] for k in range(N)]
+                raw = rt(x_traj_list[i][t], u_traj_list[i][t], x_all_t)
+                if not jnp.isfinite(raw):
+                    _any_nan_loss = True
+                    print(f"[NaN/Inf] runtime loss (pre-grad) at agent {i}, t={t}")
+                    # 打印关键中间量
+                    x_i = x_traj_list[i][t]
+                    u_i = u_traj_list[i][t]
+                    x_all_arr = jnp.stack(x_all_t, axis=0)
+                    dists = jnp.linalg.norm(x_all_arr[:, :2] - x_i[:2], axis=1)
+                    print("   x_i[:2]=", x_i[:2], "  u_i=", u_i)
+                    print("   dists[min,max]=", float(jnp.nanmin(dists)), float(jnp.nanmax(dists)))
+                    print("   any_nan dists=", bool(jnp.isnan(dists).any()), " any_inf dists=", bool(jnp.isinf(dists).any()))
+                    # 可以顺带逐项打印 goal/coll/ctrl
+                    # （与 make_runtime_loss 内的计算保持一致）
+                    break
+            if _any_nan_loss:
+                break
+
+        # Terminal loss check
+        x_T_all = [x_traj_list[k][-1] for k in range(N)]
+        term_val = terminal_loss(x_T_all)
+        print("[DEBUG] terminal_loss finite? ", bool(jnp.isfinite(term_val)))
 
         # per-agent horizon loss for gradients (sum of runtime + terminal)
         def make_total_loss_i(i):
@@ -403,6 +468,8 @@ class GameSolver:
                 for t in range(T):
                     x_all_t = [x_traj_all[k][t] for k in range(N)]
                     val = val + rt(x_traj_i[t], u_traj_i[t], x_all_t)
+                    if jnp.isnan(val):
+                        print(f"[NaN] runtime loss agent {i}, t={t}, x={x_traj_i[t]}, u={u_traj_i[t]}")
                 # terminal (use each agent's own terminal state along with others)
                 x_T_all = [x_traj_all[k][-1] for k in range(N)]
                 val = val + (1.0/N) * terminal_loss(x_T_all)  # share terminal cost evenly
@@ -415,6 +482,12 @@ class GameSolver:
             L_i = make_total_loss_i(i)
             dldx_list.append(grad(L_i, argnums=0))
             dldu_list.append(grad(L_i, argnums=1))
+            try:
+                a_traj = dldx_list[i](x_traj_list[i], u_traj_list[i], x_traj_list)
+                if jnp.isnan(a_traj).any():
+                    print(f"[NaN] dldx agent {i}")
+            except Exception as e:
+                print(f"[ERROR] grad dldx agent {i}:", e)
 
         # --- iLQGames outer loop ---
         num_iters = int(self.params.get("num_iters", 100))
@@ -425,9 +498,6 @@ class GameSolver:
             print(f"[iLQGames] Iteration {it+1}/{num_iters}...")
             A_list, B_list = [], []
             for i in range(N):
-                ilqr = iLQR(dt=dt, x_dim=x_dim_list[i], u_dim=u_dim_list[i],
-                            Q=jnp.eye(x_dim_list[i]) * 1e-6,
-                            R=jnp.eye(u_dim_list[i]) * 1e-6)
                 agent = gm["ilqr_agents"][i]
                 x_traj_i, A_traj, B_traj = agent.linearize_dyn(x0_list[i], u_traj_list[i])
                 x_traj_list[i] = x_traj_i
@@ -445,6 +515,10 @@ class GameSolver:
             for i in range(N):
                 agent = gm["ilqr_agents"][i]
                 v_u, _ = agent.solve(A_list[i], B_list[i], a_list[i], b_list[i])
+                if jnp.isnan(A_list[i]).any() or jnp.isnan(B_list[i]).any():
+                    print(f"[NaN] Linearization matrices agent {i}")
+                if jnp.isnan(a_list[i]).any() or jnp.isnan(b_list[i]).any():
+                    print(f"[NaN] Gradients agent {i}")
                 v_u_list.append(v_u)
 
             # 4) update controls
@@ -454,17 +528,25 @@ class GameSolver:
             # 5) rollout new trajectories
             x_traj_list = rollout_all(x0_list, u_traj_list)
 
+            for i, xt in enumerate(x_traj_list):
+                if jnp.isnan(xt).any():
+                    print(f"[NaN] rollout x_traj_list[{i}] has NaN at step", jnp.argwhere(jnp.isnan(xt)))
+
             # (optional) monitoring / early stop
             if it % 10 == 0:
                 # quick scalar objective for monitoring
                 tot = 0.0
                 for i in range(N):
                     rt = runtime_losses[i]
+                    # print(f"[iLQGames] Computing total cost for agent {i}...")
                     for t in range(T):
                         x_all_t = [x_traj_list[k][t] for k in range(N)]
-                        tot = tot + rt(x_traj_list[i][t], u_traj_list[i][t], x_all_t)
+                        # print(f"[iLQGames]   t={t}: x_i={x_traj_list[i][t]}, u_i={u_traj_list[i][t]}")
+                        tot_it = rt(x_traj_list[i][t], u_traj_list[i][t], x_all_t)
+                        # print(f"[iLQGames]   t={t}: total_it={tot_it:.4f}")
+                        tot = tot + tot_it
                 tot = tot + terminal_loss([x_traj_list[i][-1] for i in range(N)])
-                print(f"[iLQGames] iter {it:03d}  total loss = {float(tot):.3f}")
+                # print(f"[iLQGames] iter {it+1}, total cost: {tot:.4f}")
                 pass
 
         self.solution = dict(
