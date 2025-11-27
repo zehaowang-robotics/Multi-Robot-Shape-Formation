@@ -34,7 +34,7 @@ The project aims to model multiple robots on a 2-D plane, generate symbolic lett
 Integrates all components:
 - Creates a `U`-formation environment.
 - Samples 10 non-overlapping robot initial poses.
-- Visualizes the full setup for verification.
+- Visualizes both **initial** and **final** configurations for comparison.
 
 ---
 
@@ -44,50 +44,86 @@ Integrates all components:
 Defines structure for a **multi-agent dynamic game solver**.
 
 #### `construct_game(self)`
-To symbolically define the game:
+Symbolically defines the game:
 \[
 \min_{x^i, u^i}\;
-J^i = \sum_t \|x_t^i - (E^i P g)\|^2 
-     + w_1 \sum_{j\neq i}\mathbf{1}(\|x_t^i-x_t^j\|\le r)
-     + w_2 \|u_t^i\|^2,
+J^i = 
+\sum_t 
+\Bigl(
+w_g\|x_t^i - \hat g_i\|^2 
++ w_c\!\!\sum_{j\neq i}\psi(\|x_t^i-x_t^j\|)
++ w_u\|u_t^i\|^2
+\Bigr),
 \quad 
-x_{t+1}^i = f(x_t^i,u_t^i)
+x_{t+1}^i = f_i(x_t^i,u_t^i)
 \]
-Result: an MCP/KKT-based formulation suitable for solvers.
+where  
+- \(\hat g_i = P g_i\) is the **assigned target** for robot *i* (currently fixed);  
+- \(f_i\) is the corresponding unicycle/bicycle/double-integrator dynamics.
 
 #### `solve_game(self)`
-To numerically compute the open-loop Nash equilibrium:
-- Use **LQRAX**, **PATH**, or custom MCP solver.
-- Return equilibrium trajectories \((x^*,u^*)\) and multipliers.
-- Support visualization and analysis.
+Numerically computes the **open-loop Nash equilibrium** via an iLQR/LQRAX-style loop:
+1. Linearize each robot’s dynamics \((A_i, B_i)\);
+2. Compute loss gradients via JAX automatic differentiation;
+3. Solve per-agent LQ subproblems for descent directions;
+4. Update controls and rollout new trajectories.
+
+The solver currently supports **fixed \(P\)** and successfully finds equilibrium trajectories under a known assignment.
+
+---
+
+## ⚙️ Current Progress (Nov 2025)
+
+- ✅ **GameSolver updated:** now capable of solving the game with a *fixed assignment matrix* \(P\).  
+- ✅ **Stable runtime losses:** safe norm and stable softplus functions eliminate NaNs.  
+- ✅ **Visualization:** shows both initial and post-equilibrium formations for comparison.  
+- ⚠️ **Computation is relatively slow:** current runs are executed on CPU.
+
+---
+
+## 🔍 Future Work
+
+1. **Joint Optimization of \(P\)**  
+   - At present, the assignment matrix \(P\) is fixed before solving the game.  
+   - Next step: embed \(P\) into a higher-level optimization (bilevel or alternating structure) to achieve **joint goal assignment + trajectory optimization**.
+
+2. **Performance and Acceleration**  
+   - The iLQGames-style iteration runs entirely on CPU; per-iteration rollouts and gradient evaluations are slow.  
+   - We plan to explore **GPU acceleration (via JAX JIT and vectorization)** to evaluate potential speed-ups.
 
 ---
 
 ## ⚠️ Current Results & Known Issues
 
-- **Results are not yet correct**: the current iLQGames-style loop is still under construction; trajectories and assignments may not converge to the expected formation.
-- **Performance**: the prototype uses list-structured rollouts and per-iteration Python loops; vectorization/JIT fusion is pending, so runtime can be slow.
-- **API alignment**: the `lqrax` integration has been partially wired; remaining pieces include consistent linearization calls and stable line-search/damping.
-- **Collision avoidance**: soft constraints are in place but require tuning (weights/temperature) and optional ESDF-based distances for arbitrary shapes.
-
-We will address these in upcoming commits.
+- The solver converges for simple formations but may require careful tuning of weights and step size.  
+- Collision-avoidance weights and temperature in `psi_dist` affect numerical stability.  
+- The current implementation uses list-based rollouts (not fully vectorized), leaving performance improvements for later iterations.
 
 ---
 
 ## 🧩 Next Steps
 
-1. Finalize symbolic formulation in `construct_game()`.
-2. Implement solver logic in `solve_game()` (LQRAX / MCP) with proper linearization, line-search, and damping.
-3. Vectorize rollout and loss (JAX `vmap`/`lax.scan`), JIT the full loop, and reduce retracing.
-4. Replace Euclidean distance with ESDF for arbitrary shapes; add cutoff masks for pairwise costs.
-5. Visualize equilibrium trajectories and validate convergence across formations (`A`, `T`, `S`, …).
+1. Integrate the goal-assignment optimization into `construct_game()` to jointly optimize \(P\).  
+2. JIT-compile rollout and gradient computation; benchmark CPU vs GPU runtime.  
+3. Extend distance modeling with ESDF for arbitrary robot shapes.  
+4. Add convergence visualization and per-agent cost breakdown plots.
+
+---
+
+## 📊 Visualization Example
+
+Below are example visualizations of the **initial** and **post-game (equilibrium)** configurations for the `U`-formation case.
+
+| Initial Condition | Terminal Condition (After Game Solving) |
+|--------------------|-----------------------------------------|
+| ![Initial](./init_condition.png) | ![Terminal](./terminal_condition.png) |
 
 ---
 
 ## 👥 Contributors
 | Name | Contribution |
 |------|---------------|
-| **Zehao Wang** | Environment & robot generation, visualization |
+| **Zehao Wang** | Environment & robot generation, solver implementation, visualization |
 | **Tianyu Qiu** | Framework design |
 | **Shotaro Nako** | Code development |
 
@@ -95,5 +131,6 @@ We will address these in upcoming commits.
 
 ## 📅 Project Status
 - ✅ Core framework & visualization — **Completed**  
-- 🚧 Game formulation & solver — **In progress**  
-- 🔜 Equilibrium visualization — **Upcoming**
+- ✅ Fixed-P game solver — **Working**  
+- 🚧 Joint \(P\) optimization — **Next milestone**  
+- 🔜 GPU acceleration & performance profiling — **Upcoming**
