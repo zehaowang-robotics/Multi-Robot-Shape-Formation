@@ -1,7 +1,8 @@
 # Multi-Robot Formation Game (Work in Progress)
 
 This repository provides a **research prototype** for multi-robot formation control and **game-theoretic trajectory optimization**.  
-The project aims to model multiple robots on a 2-D plane, generate symbolic letter formations, and later formulate the task as an **open-loop dynamic game** solvable via **LQRAX** or **MCP-based** methods.
+We model multiple robots on a 2-D plane, generate letter-shaped formations, and solve an **open-loop dynamic game** using an iLQGames/LQRAX-style method.  
+A receding-horizon **MPC loop** is available to execute **one step per round** until all agents reach their assigned goals.
 
 ---
 
@@ -30,18 +31,8 @@ The project aims to model multiple robots on a 2-D plane, generate symbolic lett
   - Scene bounds rectangle.
 - Legend placed **outside the upper-right corner** for clarity.
 
-### 4. Main Script (`main.py`)
-Integrates all components:
-- Creates a `U`-formation environment.
-- Samples 10 non-overlapping robot initial poses.
-- Visualizes both **initial** and **final** configurations for comparison.
-
----
-
-## 🧠 Work in Progress
-
-### GameSolver (`game_solver.py`)
-Defines structure for a **multi-agent dynamic game solver**.
+### 4. Game Solver (`game_solver.py`)
+Defines the **multi-agent dynamic game** and computes an **open-loop Nash equilibrium (OLNE)**.
 
 #### `construct_game(self)`
 Symbolically defines the game:
@@ -58,64 +49,92 @@ w_g\|x_t^i - \hat g_i\|^2
 x_{t+1}^i = f_i(x_t^i,u_t^i)
 \]
 where  
-- \(\hat g_i = P g_i\) is the **assigned target** for robot *i* (currently fixed);  
+- \(\hat g_i = P g_i\) is the **assigned target** for robot *i* (currently fixed),  
 - \(f_i\) is the corresponding unicycle/bicycle/double-integrator dynamics.
 
 #### `solve_game(self)`
-Numerically computes the **open-loop Nash equilibrium** via an iLQR/LQRAX-style loop:
+Numerically computes the **OLNE** using an iLQR/LQRAX-style iteration:
 1. Linearize each robot’s dynamics \((A_i, B_i)\);
-2. Compute loss gradients via JAX automatic differentiation;
-3. Solve per-agent LQ subproblems for descent directions;
+2. Compute loss gradients via JAX autodiff;
+3. Solve per-agent LQ subproblems;
 4. Update controls and rollout new trajectories.
 
-The solver currently supports **fixed \(P\)** and successfully finds equilibrium trajectories under a known assignment.
+**Recent improvements:**
+- Gradients are **JIT-compiled once** and reused for all iterations (big speedup).
+- Rollout and monitor now use **`lax.scan` + `jit`** to reduce Python overhead.
+- Added **external warmup** to compile kernels before the loop (`warmup_only=True`).
+- Added **construct-once, refresh-fast** mode: static parts are built once; per-round updates only refresh states and controls.
+- Added detailed timing logs per iteration.
 
 ---
 
-## ⚙️ Current Progress (Nov 2025)
+## ⚙️ MPC Integration (`main.py`)
 
-- ✅ **GameSolver updated:** now capable of solving the game with a *fixed assignment matrix* \(P\).  
-- ✅ **Stable runtime losses:** safe norm and stable softplus functions eliminate NaNs.  
-- ✅ **Visualization:** shows both initial and post-equilibrium formations for comparison.  
-- ⚠️ **Computation is relatively slow:** current runs are executed on CPU.
-
----
-
-## 🔍 Future Work
-
-1. **Joint Optimization of \(P\)**  
-   - At present, the assignment matrix \(P\) is fixed before solving the game.  
-   - Next step: embed \(P\) into a higher-level optimization (bilevel or alternating structure) to achieve **joint goal assignment + trajectory optimization**.
-
-2. **Performance and Acceleration**  
-   - The iLQGames-style iteration runs entirely on CPU; per-iteration rollouts and gradient evaluations are slow.  
-   - We plan to explore **GPU acceleration (via JAX JIT and vectorization)** to evaluate potential speed-ups.
+- Implements a **receding-horizon MPC** loop:
+  - Solves the game each round, applies **only the first control step**, and repeats.
+  - Warm-starts each round by shifting the previous control sequence.
+  - Stops when all robots are within a positional tolerance of their goals.
+- Example timing log:
+- [TIMING] it=... | linearize=... | grads=... | solve=... | update=... | rollout=... | monitor=... | total=...
 
 ---
 
-## ⚠️ Current Results & Known Issues
+## 🧠 Objective Summary
 
-- The solver converges for simple formations but may require careful tuning of weights and step size.  
-- Collision-avoidance weights and temperature in `psi_dist` affect numerical stability.  
-- The current implementation uses list-based rollouts (not fully vectorized), leaving performance improvements for later iterations.
+Each agent minimizes a weighted combination of:
+- **Goal-tracking** loss (\(w_g\|x_t^i-\hat g_i\|^2\)),
+- **Collision penalty** (softplus-hinged on squared distances),
+- **Control effort** (\(w_u\|u_t^i\|^2\)).
 
----
-
-## 🧩 Next Steps
-
-1. Integrate the goal-assignment optimization into `construct_game()` to jointly optimize \(P\).  
-2. JIT-compile rollout and gradient computation; benchmark CPU vs GPU runtime.  
-3. Extend distance modeling with ESDF for arbitrary robot shapes.  
-4. Add convergence visualization and per-agent cost breakdown plots.
+The collision term \(\psi(\cdot)\) is smooth and avoids hard constraints for stability.
 
 ---
 
-## 📊 Visualization Example
+## 🚀 What’s New (Nov 2025)
 
-Below are example visualizations of the **initial** and **post-game (equilibrium)** configurations for the `U`-formation case.
+- ✅ **MPC one-step execution** with warm-start.
+- ✅ **Construct-once / refresh-fast** game setup.
+- ✅ **JIT-compiled gradients** reused across rounds.
+- ✅ **Rollout and monitor** fully JITed.
+- ✅ **External warmup** reduces first-iteration cost.
+- ✅ **Detailed timing profiling** for each iteration.
 
-| Initial Condition | Terminal Condition (After Game Solving) |
-|--------------------|-----------------------------------------|
+---
+
+## ⚙️ Current Results
+
+- Solver converges for simple formations under moderate weights.
+- Visualization shows both initial and final formations.
+- Stable gradient evaluation and rollout under most conditions.
+- Typical iteration timing (CPU): 15–25 ms after warmup.
+
+---
+
+## ⚠️ Known Issues
+
+1. **Occasional NaN/Inf**
+ - Occurs when robots get too close or weights are overly aggressive.
+ - Mitigations (softplus, hinge on squared distance) are in place but not foolproof.
+
+2. **Occasional Robot Overlap**
+ - Current soft collision penalties may allow slight overlaps.
+ - Future work: stronger anisotropic penalties, ESDF distances, or explicit constraints (MCP/MPCC).
+
+---
+
+## 🗺️ Roadmap
+
+1. **Joint optimization of \(P\)** (assignment + trajectories).
+2. **ESDF-based shape-aware collision modeling.**
+3. **GPU acceleration** via JAX JIT and vectorization.
+4. **Convergence visualization** and per-agent cost breakdown.
+
+---
+
+## 📈 Visualization Example
+
+| Initial Condition | Terminal Condition |
+|--------------------|--------------------|
 | ![Initial](./init_condition.png) | ![Terminal](./terminal_condition.png) |
 
 ---
@@ -123,14 +142,17 @@ Below are example visualizations of the **initial** and **post-game (equilibrium
 ## 👥 Contributors
 | Name | Contribution |
 |------|---------------|
-| **Zehao Wang** | Environment & robot generation, solver implementation, visualization |
+| **Zehao Wang** | Environment & robot generation, solver/MPC implementation, visualization |
 | **Tianyu Qiu** | Framework design |
 | **Shotaro Nako** | Code development |
 
 ---
 
-## 📅 Project Status
-- ✅ Core framework & visualization — **Completed**  
-- ✅ Fixed-P game solver — **Working**  
-- 🚧 Joint \(P\) optimization — **Next milestone**  
-- 🔜 GPU acceleration & performance profiling — **Upcoming**
+## 🧾 Changelog (recent)
+- Added **MPC loop** with one-step execution and stopping criteria.  
+- Added `refresh_for_mpc()` for per-round updates.  
+- Cached **JAX gradients** for speedup.  
+- Added **external warmup** compilation.  
+- JITed rollout and monitor via `lax.scan`.  
+- Added detailed **timing logs**.  
+- Smoothed collision penalty to avoid NaNs/Instability.

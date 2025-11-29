@@ -1,5 +1,6 @@
 # game_solver.py
 from __future__ import annotations
+from time import perf_counter as _now
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
 from robot import Robot
@@ -9,7 +10,8 @@ import numpy as np
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
-from jax import jit, vmap, grad
+import jax.tree_util as jtu
+from jax import jit, vmap, grad, lax
 @dataclass
 class GameSolver:
     """
@@ -301,7 +303,6 @@ class GameSolver:
                 xs.append(x)
             return jnp.stack(xs, axis=0)  # (T, x_dim)
         
-        
         ilqr_agents = []
 
         # 为每个机器人构造 iLQR 子类，按最小状态定义 dyn(xt, ut) 返回连续时间导数
@@ -355,7 +356,57 @@ class GameSolver:
                                             Q=jnp.eye(4)*1e-2, R=jnp.eye(2)*1e-2))
             else:
                 raise ValueError(f"Unknown steering_type {stype}")
+        
+        hat_g_j = jnp.asarray(hat_g)                         # (N,2)
+        w_goal_j = jnp.asarray(w.get("w_goal", 1.0))
+        w_collision_j = jnp.asarray(w.get("w_collision", 10.0))
+        w_control_j = jnp.asarray(w.get("w_control", 0.1))
+        w_terminal_j = jnp.asarray(w.get("w_terminal", 1.0))
+        r_safe_j = jnp.asarray(r_safe)
+        
+        def make_total_loss_i_cached(i):
+            """Build per-agent total loss with outer-captured constants (single compile)."""
+            def _softplus(x, alpha=20.0):
+                return jnn.softplus(alpha * x) / alpha
 
+            r2 = r_safe_j * r_safe_j
+            def psi_sq(d2):
+                return _softplus(r2 - d2)
+
+            def total_loss_i(x_traj_i, u_traj_i, x_traj_all):
+                # Precompute positions once: (N,T,2)
+                pos_all = jnp.stack([xt[:, :2] for xt in x_traj_all], axis=0)
+                pos_i = x_traj_i[:, :2]
+                Nloc = pos_all.shape[0]
+                mask = jnp.ones((Nloc,), dtype=pos_all.dtype).at[i].set(0.0)
+
+                def body(acc, t):
+                    # goal tracking
+                    gt = w_goal_j * jnp.sum((pos_i[t] - hat_g_j[i]) ** 2)
+                    # collision
+                    diffs = pos_all[:, t, :] - pos_i[t]
+                    d2 = jnp.sum(diffs * diffs, axis=1)
+                    coll = w_collision_j * jnp.sum(mask * psi_sq(d2))
+                    # control effort
+                    ce = w_control_j * jnp.sum(u_traj_i[t] ** 2)
+                    return acc + gt + coll + ce, None
+
+                val, _ = lax.scan(body, 0.0, jnp.arange(x_traj_i.shape[0]))
+                # terminal (shared evenly)
+                x_T_all = [x_traj_all[k][-1] for k in range(Nloc)]
+                val = val + (1.0 / Nloc) * w_terminal_j * terminal_loss(x_T_all)
+                return val
+
+            return total_loss_i
+
+        # Compile and store gradient functions once
+        dldx_list, dldu_list = [], []
+        for i in range(N):
+            L_i = make_total_loss_i_cached(i)
+            dldx_list.append(jit(grad(L_i, argnums=0)))
+            dldu_list.append(jit(grad(L_i, argnums=1)))
+        
+        # --- 7) Final assembly into
         # package model
         self.game_model = dict(
             N=N, T=T, dt=dt,
@@ -372,11 +423,79 @@ class GameSolver:
             radius=r_safe,
             rollout_agent=rollout_agent,
             ilqr_agents=ilqr_agents,
+            dldx_list=dldx_list,
+            dldu_list=dldu_list,
             assignment_model=p.get("assignment_model", None),
         )
+        
+    def refresh_for_mpc(self, u_init_list=None, recompute_assignment=True):
+        """
+        Lightweight refresh for MPC:
+        - Update x0_list from current self.params['robots'] states.
+        - Optionally update u_traj_list with a warm-start (same shape as before).
+        - Optionally recompute hat_g using the same rule as in construct_game.
+        Assumes all static shapes/params (N, T, dims, dynamics) remain unchanged.
+        """
+        if self.game_model is None:
+            raise RuntimeError("Call construct_game() once before refresh_for_mpc().")
 
+        gm = self.game_model
+        robots = self.params.get("robots", None)
+        if robots is None:
+            raise ValueError("params['robots'] must be set before refresh_for_mpc().")
 
-    def solve_game(self):
+        N, T = gm["N"], gm["T"]
+        x_dim_list = gm["x_dim_list"]
+        u_dim_list = gm["u_dim_list"]
+        g = gm["g"]
+
+        # 1) Rebuild x0_list from current robots (minimal state per steering type)
+        def _x0_from_robot(rb: "Robot"):
+            st = rb.state
+            if rb.steering_type in ("bicycle", "unicycle"):
+                return jnp.array([st["x"], st["y"], st["theta"]], dtype=float)
+            elif rb.steering_type == "double-integrator":
+                return jnp.array([st["x"], st["y"], st["v_x"], st["v_y"]], dtype=float)
+            else:
+                raise ValueError(f"Unknown steering_type {rb.steering_type}")
+
+        x0_list = [ _x0_from_robot(rb) for rb in robots ]
+        gm["x0_list"] = x0_list  # in-place refresh
+
+        # 2) Warm start controls if provided (must keep shapes (T,u_dim) unchanged)
+        if u_init_list is not None:
+            if len(u_init_list) != N:
+                raise ValueError(f"u_init_list length {len(u_init_list)} != N={N}")
+            casted = []
+            for k in range(N):
+                U = jnp.asarray(u_init_list[k])
+                if U.shape != (T, u_dim_list[k]):
+                    raise ValueError(f"u_init_list[{k}] has shape {U.shape}, expected {(T, u_dim_list[k])}")
+                casted.append(U)
+            gm["u_traj_list"] = casted
+
+        # 3) Optionally recompute assignment hat_g (priority: assignment_model > greedy NN)
+        if recompute_assignment:
+            if self.params.get("assignment_model", None) is not None:
+                hat_g = self.params["assignment_model"].hat_g(g)
+            else:
+                x0_xy = jnp.stack([x0[:2] for x0 in x0_list], axis=0)  # (N,2)
+                used = set()
+                hat = []
+                for i in range(N):
+                    dists = jnp.linalg.norm(g - x0_xy[i], axis=1)
+                    order = np.argsort(np.array(dists))
+                    chosen = None
+                    for idx in order:
+                        if int(idx) not in used:
+                            chosen = int(idx); break
+                    if chosen is None: chosen = int(order[0])
+                    used.add(chosen)
+                    hat.append(g[chosen])
+                hat_g = jnp.stack(hat, axis=0)
+            gm["hat_g"] = hat_g
+
+    def solve_game(self, warmup_only: bool = False, do_warmup: bool = True):
         """
         Solve Γ(P) via iLQGames-style iterations (requires lqrax).
         If 'lqrax' is unavailable, raises a clear error.
@@ -404,21 +523,35 @@ class GameSolver:
         rollout_agent = gm["rollout_agent"]
         hat_g = gm["hat_g"]
         
-        print("[DEBUG] Initial x0_list:")
-        for i, x0 in enumerate(x0_list):
-            print(f"  Robot {i}:", x0,
-                "  has_nan=", bool(jnp.isnan(x0).any()),
-                "  has_inf=", bool(jnp.isinf(x0).any()))
+        # --- Pull weights and constants into this scope (JAX-friendly scalars)
+        w_dict = gm["weights"]
+        w_goal = jnp.asarray(w_dict.get("w_goal", 1.0))
+        w_collision = jnp.asarray(w_dict.get("w_collision", 10.0))
+        w_control = jnp.asarray(w_dict.get("w_control", 0.1))
+        w_terminal = jnp.asarray(w_dict.get("w_terminal", 1.0))
 
-        print("[DEBUG] Initial u_traj_list stats (per agent):")
-        for i, U in enumerate(u_traj_list):
-            print(f"  Agent {i}: shape={tuple(U.shape)}, "
-                f"mean={float(jnp.nanmean(U)):.6f}, "
-                f"std={float(jnp.nanstd(U)):.6f}, "
-                f"has_nan={bool(jnp.isnan(U).any())}, "
-                f"has_inf={bool(jnp.isinf(U).any())}")
+        r_safe = jnp.asarray(gm["radius"])
+        hat_g = jnp.asarray(hat_g)  # ensure device array
+        
+        # print("[DEBUG] Initial x0_list:")
+        # for i, x0 in enumerate(x0_list):
+            # print(f"  Robot {i}:", x0,
+            #     "  has_nan=", bool(jnp.isnan(x0).any()),
+            #     "  has_inf=", bool(jnp.isinf(x0).any()))
+
+        # print("[DEBUG] Initial u_traj_list stats (per agent):")
+        # for i, U in enumerate(u_traj_list):
+            # print(f"  Agent {i}: shape={tuple(U.shape)}, "
+            #     f"mean={float(jnp.nanmean(U)):.6f}, "
+            #     f"std={float(jnp.nanstd(U)):.6f}, "
+            #     f"has_nan={bool(jnp.isnan(U).any())}, "
+            #     f"has_inf={bool(jnp.isinf(U).any())}")
 
         # --- helpers ---
+        def _block_tree(x):
+            # Force JAX to finish async work for accurate timing
+            return jtu.tree_map(lambda a: a.block_until_ready() if hasattr(a, "block_until_ready") else a, x)
+        
         def rollout_all(x0L, uL):
             return [rollout_agent(dyn_list[i], x0L[i], uL[i]) for i in range(N)]
 
@@ -461,93 +594,174 @@ class GameSolver:
         print("[DEBUG] terminal_loss finite? ", bool(jnp.isfinite(term_val)))
 
         # per-agent horizon loss for gradients (sum of runtime + terminal)
-        def make_total_loss_i(i):
-            rt = runtime_losses[i]
-            def total_loss_i(x_traj_i, u_traj_i, x_traj_all):
-                val = 0.0
-                for t in range(T):
-                    x_all_t = [x_traj_all[k][t] for k in range(N)]
-                    val = val + rt(x_traj_i[t], u_traj_i[t], x_all_t)
-                    if jnp.isnan(val):
-                        print(f"[NaN] runtime loss agent {i}, t={t}, x={x_traj_i[t]}, u={u_traj_i[t]}")
-                # terminal (use each agent's own terminal state along with others)
-                x_T_all = [x_traj_all[k][-1] for k in range(N)]
-                val = val + (1.0/N) * terminal_loss(x_T_all)  # share terminal cost evenly
-                return val
-            return total_loss_i
+        
+        def make_total_loss_i(i: int):
+            """Total horizon cost for agent i. Uses outer-scope JAX scalars and arrays."""
+            # smooth hinge on squared distance to avoid sqrt cost (optional)
+            def _softplus(x, alpha=20.0):
+                return jnn.softplus(alpha * x) / alpha
 
+            r2 = r_safe * r_safe
+            def psi_sq(d2):
+                # smooth max(0, r^2 - d^2)
+                return _softplus(r2 - d2)
+
+            def total_loss_i(x_traj_i, u_traj_i, x_traj_all):
+                # Precompute (N, T, 2) positions once
+                pos_all = jnp.stack([xt[:, :2] for xt in x_traj_all], axis=0)  # (N, T, 2)
+                pos_i = x_traj_i[:, :2]                                       # (T, 2)
+
+                # mask to remove self-collision
+                mask = jnp.ones((N,), dtype=pos_all.dtype).at[i].set(0.0)
+
+                def body(acc, t):
+                    # goal tracking
+                    gt = w_goal * jnp.sum((pos_i[t] - hat_g[i]) ** 2)
+
+                    # collision (vectorized)
+                    diffs = pos_all[:, t, :] - pos_i[t]        # (N, 2)
+                    d2 = jnp.sum(diffs * diffs, axis=1)        # (N,)
+                    coll = w_collision * jnp.sum(mask * psi_sq(d2))
+
+                    # control effort
+                    ce = w_control * jnp.sum(u_traj_i[t] ** 2)
+                    return acc + gt + coll + ce, None
+
+                val, _ = lax.scan(body, 0.0, jnp.arange(x_traj_i.shape[0]))
+
+                # terminal loss shared evenly
+                x_T_all = [x_traj_all[k][-1] for k in range(N)]
+                val = val + (1.0 / N) * (w_terminal * jnp.sum(
+                    jnp.stack([x_T_all[k][:2] for k in range(N)], axis=0) - hat_g
+                )**2).sum() * 0.0 + (1.0 / N) * w_terminal * jnp.sum(
+                    jnp.stack([x_T_all[k][:2] for k in range(N)], axis=0) - hat_g
+                )**2  # keep structure similar; you也可直接调用原 terminal_loss
+
+                return val
+
+            return total_loss_i
+        
         # JAX grads for linearized loss
-        dldx_list, dldu_list = [], []
-        for i in range(N):
-            L_i = make_total_loss_i(i)
-            dldx_list.append(grad(L_i, argnums=0))
-            dldu_list.append(grad(L_i, argnums=1))
+        dldx_list = gm["dldx_list"]
+        dldu_list = gm["dldu_list"]
+
+        # --- optional warmup to JIT-compile key kernels BEFORE iterations ---
+        if do_warmup:
             try:
-                a_traj = dldx_list[i](x_traj_list[i], u_traj_list[i], x_traj_list)
-                if jnp.isnan(a_traj).any():
-                    print(f"[NaN] dldx agent {i}")
-            except Exception as e:
-                print(f"[ERROR] grad dldx agent {i}:", e)
+                # 1) one linearize to get shapes
+                A_w, B_w = [], []
+                for i in range(N):
+                    agent = gm["ilqr_agents"][i]
+                    _, A_traj, B_traj = agent.linearize_dyn(x0_list[i], u_traj_list[i])
+                    A_w.append(A_traj); B_w.append(B_traj)
+
+                # 2) one gradient eval to compile dldx/dldu
+                a_w, b_w = [], []
+                for i in range(N):
+                    a_w.append(dldx_list[i](x_traj_list[i], u_traj_list[i], x_traj_list))
+                    b_w.append(dldu_list[i](x_traj_list[i], u_traj_list[i], x_traj_list))
+
+                # 3) one LQ solve per agent
+                for i in range(N):
+                    agent = gm["ilqr_agents"][i]
+                    _vu, _ = agent.solve(A_w[i], B_w[i], a_w[i], b_w[i])
+
+                # 4) rollout and (optional) monitor once to compile those too
+                _ = [rollout_agent(dyn_list[i], x0_list[i], u_traj_list[i]) for i in range(N)]
+                if 'monitor_fn' in gm:
+                    _ = gm['monitor_fn'](x_traj_list, u_traj_list)
+
+                _block_tree((A_w, B_w, a_w, b_w))  # ensure async work finished
+                print("[warmup] kernels compiled.")
+            except Exception as _e:
+                print("[WARN] warmup failed (ok to ignore):", _e)
+
+        # return early if we only wanted to warm up
+        if warmup_only:
+            return
+
 
         # --- iLQGames outer loop ---
         num_iters = int(self.params.get("num_iters", 100))
         step_size = float(self.params.get("step_size", 1e-2))
 
         for it in range(num_iters):
-            # 1) linearize dynamics around current rollout using lqrax helpers
-            print(f"[iLQGames] Iteration {it+1}/{num_iters}...")
+            t_iter0 = _now()
+
+            # 1) linearize dynamics
+            t0 = _now()
             A_list, B_list = [], []
             for i in range(N):
                 agent = gm["ilqr_agents"][i]
                 x_traj_i, A_traj, B_traj = agent.linearize_dyn(x0_list[i], u_traj_list[i])
+                # Assign and collect
                 x_traj_list[i] = x_traj_i
                 A_list.append(A_traj); B_list.append(B_traj)
+            _block_tree((x_traj_list, A_list, B_list))  # ensure timing correctness
+            t_lin = _now() - t0
 
-            # 2) linearize losses per agent
+            # 2) linearize losses (gradients)
+            t0 = _now()
             a_list, b_list = [], []
             for i in range(N):
                 a_traj = dldx_list[i](x_traj_list[i], u_traj_list[i], x_traj_list)
                 b_traj = dldu_list[i](x_traj_list[i], u_traj_list[i], x_traj_list)
                 a_list.append(a_traj); b_list.append(b_traj)
+            _block_tree((a_list, b_list))
+            t_grad = _now() - t0
 
-            # 3) solve LQ subproblem for descent direction in controls
+            # 3) solve LQ subproblem
+            t0 = _now()
             v_u_list = []
             for i in range(N):
                 agent = gm["ilqr_agents"][i]
                 v_u, _ = agent.solve(A_list[i], B_list[i], a_list[i], b_list[i])
-                if jnp.isnan(A_list[i]).any() or jnp.isnan(B_list[i]).any():
-                    print(f"[NaN] Linearization matrices agent {i}")
-                if jnp.isnan(a_list[i]).any() or jnp.isnan(b_list[i]).any():
-                    print(f"[NaN] Gradients agent {i}")
                 v_u_list.append(v_u)
+            _block_tree(v_u_list)
+            t_solve = _now() - t0
 
             # 4) update controls
+            t0 = _now()
             for i in range(N):
                 u_traj_list[i] = u_traj_list[i] + step_size * v_u_list[i]
+            # Pure numpy/JAX host ops; no need to block but harmless:
+            _block_tree(u_traj_list)
+            t_update = _now() - t0
 
             # 5) rollout new trajectories
-            x_traj_list = rollout_all(x0_list, u_traj_list)
-
-            for i, xt in enumerate(x_traj_list):
-                if jnp.isnan(xt).any():
-                    print(f"[NaN] rollout x_traj_list[{i}] has NaN at step", jnp.argwhere(jnp.isnan(xt)))
+            t0 = _now()
+            x_traj_list = [rollout_agent(dyn_list[i], x0_list[i], u_traj_list[i]) for i in range(N)]
+            _block_tree(x_traj_list)
+            t_roll = _now() - t0
 
             # (optional) monitoring / early stop
-            if it % 10 == 0:
-                # quick scalar objective for monitoring
-                tot = 0.0
-                for i in range(N):
-                    rt = runtime_losses[i]
-                    # print(f"[iLQGames] Computing total cost for agent {i}...")
-                    for t in range(T):
-                        x_all_t = [x_traj_list[k][t] for k in range(N)]
-                        # print(f"[iLQGames]   t={t}: x_i={x_traj_list[i][t]}, u_i={u_traj_list[i][t]}")
-                        tot_it = rt(x_traj_list[i][t], u_traj_list[i][t], x_all_t)
-                        # print(f"[iLQGames]   t={t}: total_it={tot_it:.4f}")
-                        tot = tot + tot_it
-                tot = tot + terminal_loss([x_traj_list[i][-1] for i in range(N)])
-                # print(f"[iLQGames] iter {it+1}, total cost: {tot:.4f}")
-                pass
+            t0 = _now()
+            # if it % 10 == 0:
+            #     pass
+            #     tot = 0.0
+            #     for i in range(N):
+            #         rt = runtime_losses[i]
+            #         for t in range(T):
+            #             x_all_t = [x_traj_list[k][t] for k in range(N)]
+            #             tot_it = rt(x_traj_list[i][t], u_traj_list[i][t], x_all_t)
+            #             tot = tot + tot_it
+            #     tot = tot + terminal_loss([x_traj_list[i][-1] for i in range(N)])
+            #     _block_tree(tot)
+            t_monitor = _now() - t0
+
+            t_iter = _now() - t_iter0
+
+            # Pretty timing print (ms)
+            print(
+                f"[TIMING] it={it+1:03d} | "
+                f"linearize={t_lin*1e3:7.2f} ms | "
+                f"grads={t_grad*1e3:7.2f} ms | "
+                f"solve={t_solve*1e3:7.2f} ms | "
+                f"update={t_update*1e3:7.2f} ms | "
+                f"rollout={t_roll*1e3:7.2f} ms | "
+                f"monitor={t_monitor*1e3:7.2f} ms | "
+                f"total={t_iter*1e3:7.2f} ms"
+            )
 
         self.solution = dict(
             x_traj_list=x_traj_list,

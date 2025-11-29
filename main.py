@@ -8,24 +8,53 @@ from environment import Environment
 from basic_utils import visualize_scene, _bounds_rect_from_Ab, _sample_nonoverlapping_poses
 from game_solver import GameSolver
 
+def _x_from_robot(rb: Robot):
+    """Minimal state vector used by GameSolver/iLQR per steering_type."""
+    st = rb.state
+    if rb.steering_type in ("unicycle", "bicycle"):
+        return np.array([st["x"], st["y"], st["theta"]], dtype=float)
+    elif rb.steering_type == "double-integrator":
+        return np.array([st["x"], st["y"], st["v_x"], st["v_y"]], dtype=float)
+    else:
+        raise ValueError(f"Unknown steering_type {rb.steering_type}")
+
+def _apply_state_to_robot(rb: Robot, x_minimal):
+    """Write minimal state back into Robot.state."""
+    if rb.steering_type in ("unicycle", "bicycle"):
+        rb.set_state(x=float(x_minimal[0]), y=float(x_minimal[1]), theta=float(x_minimal[2]))
+    elif rb.steering_type == "double-integrator":
+        # If Robot supports velocity keys, set them as well.
+        rb.set_state(x=float(x_minimal[0]), y=float(x_minimal[1]))
+        rb.state["v_x"] = float(x_minimal[2])
+        rb.state["v_y"] = float(x_minimal[3])
+    else:
+        raise ValueError(f"Unknown steering_type {rb.steering_type}")
+
+def _shift_warmstart(u_traj_list):
+    """Shift control sequences left by one step for warm start; pad last step with zeros."""
+    out = []
+    for U in u_traj_list:
+        U = np.asarray(U)
+        if U.shape[0] <= 1:
+            out.append(np.zeros_like(U))
+        else:
+            pad = np.zeros((1, U.shape[1]), dtype=U.dtype)
+            out.append(np.vstack([U[1:], pad]))
+    return out
+
 def main():
     # Reproducibility
     rng = np.random.default_rng(12345)
 
-    # 1) Environment: larger scene and "U" formation
+    # 1) Environment and goals
     env = Environment(formation="U", num_robot=10)
-    # Enlarge the rectangle (wider area than default): [-8, 8] x [-5, 5]
     env.set_rect_bounds(xmin=-8.0, ymin=-5.0, xmax=8.0, ymax=5.0)
 
-    # 2) Sample 10 robots with non-overlapping initial states
+    # 2) Sample robots
     N = 10
     xmin, ymin, xmax, ymax = _bounds_rect_from_Ab(env.bounds)
-
-    # Choose per-robot radii (constant here, but could be heterogeneous)
     radius_val = 0.40
     radii = [radius_val for _ in range(N)]
-
-    # Extra margin to be conservative on overlaps
     sep_margin = 0.05
 
     xs, ys, thetas = _sample_nonoverlapping_poses(
@@ -47,67 +76,100 @@ def main():
             state={"x": float(xs[i]), "y": float(ys[i]), "theta": float(thetas[i]), "v": 0.0, "w": 0.0},
         )
         robots.append(r)
-        
+
     print("[info] Sampled initial robot states:")
 
-    # 3) Instantiate and wire the game solver
+    # 3) MPC parameters
+    dt = 0.1
+    T_horizon = 20            # short finite horizon for MPC
+    pos_tol = 0.10            # position tolerance to declare 'reached'
+    max_mpc_steps = 300       # safety cap on outer MPC steps
+    vis_every = 1             # set >0 to visualize every k steps (0 disables intermediate viz)
+
+    # 4) Initialize GameSolver params (we will reuse and update per MPC step)
     gs = GameSolver(
         params={
             "N": N,
-            "dt": 0.1,
-            "T": 100,
-            "weights": {"w_goal": 1.0, "w_collision": 10.0, "w_control": 0.1, "w_terminal": 1.0},
+            "dt": dt,
+            "T": T_horizon,
+            "weights": {"w_goal": 1.0, "w_collision": 1e3, "w_control": 0.01, "w_terminal": 1.0},
             "radius": radius_val,
-            # 关键：把环境与机器人交给 GameSolver，g(目标)从 env 提供
             "environment": env,
             "robots": robots,
             "g": np.asarray(env.goals, dtype=float),
-            # 可选：初始控制不提供则自动置零
-            # 可选：若有分配模型或固定P，可加：
-            # "assignment_model": your_assignment_model,
-            # "P": your_fixed_P,  # (N,N)
-            # 可选：迭代参数
-            "num_iters": 100,
-            "step_size": 1e-4,
+            "num_iters": 100,     # fewer inner iters per MPC round is typical
+            "step_size": 1e-3,
         }
     )
-    
-    print("[info] Starting construct the game...")
 
-    # 4) Build and solve the game
-    gs.construct_game()
-    
-    print("[info] Trying to solve the game...")
-    try:
-        gs.solve_game()
-    except RuntimeError as e:
-        print(f"[WARN] solve_game failed: {e}")
-        visualize_scene(robots, env)
-        return
-
-    # 5) 先画“初始状态图”（此时 robots 仍是初始状态）
+    # 5) Visualize initial scene
     print("[info] Visualizing initial scene...")
     visualize_scene(robots, env)
 
-    # 6) 再画“最终状态图”：用拷贝承载终点解，避免覆盖初始 robots
-    sol = gs.solution
-    x_traj_list = sol["x_traj_list"]
+    # 6) Outer MPC loop
+    last_controls = None  # for warm start
+    gs.construct_game()
+    gs.solve_game(warmup_only=True, do_warmup=True)
+    for k in range(max_mpc_steps):
+        # shift warm start
+        if last_controls is not None:
+            u_warm = _shift_warmstart(last_controls)
+        else:
+            u_warm = None
 
-    robots_final = copy.deepcopy(robots)
-    for i in range(N):
-        x_T = np.array(x_traj_list[i][-1])  # unicycle/bicycle: [x, y, theta]
-        robots_final[i].set_state(x=float(x_T[0]), y=float(x_T[1]), theta=float(x_T[2]))
+        # (b) Refresh game model with current robot states
+        gs.refresh_for_mpc(u_init_list=u_warm, recompute_assignment=True)
 
+        # (c) Solve current finite-horizon game
+        try:
+            gs.solve_game(do_warmup=False)
+        except RuntimeError as e:
+            print(f"[WARN] solve_game failed at MPC step {k}: {e}")
+            break
+
+        sol = gs.solution
+        x_traj_list = sol["x_traj_list"]
+        u_traj_list = sol["u_traj_list"]
+        last_controls = [np.array(U) for U in u_traj_list]  # cache for next warm start
+
+        # (d) Apply *one* step of the planned motion to the real robots
+        #     We step using dyn_list[ i ] from the built model to ensure consistency.
+        dyn_list = gs.game_model["dyn_list"]
+        x0_list = [ _x_from_robot(rb) for rb in robots ]
+        for i in range(N):
+            u0 = np.array(u_traj_list[i][0])       # first control
+            x1 = np.array(dyn_list[i](x0_list[i], u0))  # one-step forward
+            _apply_state_to_robot(robots[i], x1)
+
+        # (e) Check stopping criterion
+        hat_g = np.array(sol["hat_g"])  # (N,2)
+        pos = np.array([[rb.state["x"], rb.state["y"]] for rb in robots])
+        dists = np.linalg.norm(pos - hat_g, axis=1)
+        all_reached = bool(np.all(dists <= pos_tol))
+
+        print(f"[MPC] step={k:03d}  max_dist={dists.max():.3f}  mean_dist={dists.mean():.3f}  reached={all_reached}")
+
+        # (f) Optional intermediate visualization
+        if vis_every and (k % vis_every == 0):
+            visualize_scene(robots, env)
+
+        if all_reached:
+            print(f"[MPC] All agents reached goals within tolerance {pos_tol}.")
+            break
+
+    # 7) Final visualization
     print("[info] Visualizing final scene...")
+    robots_final = copy.deepcopy(robots)
     visualize_scene(robots_final, env)
 
-    # （可选）打印分配信息
-    hat_g = sol.get("hat_g", None)
-    P = sol.get("P", None)
-    if hat_g is not None:
-        print("[info] hat_g (assigned goals) shape:", np.asarray(hat_g).shape)
-    if P is not None:
-        print("[info] P provided by assignment_model with shape:", np.asarray(P).shape)
-        
+    # (optional) print assignment info from last solve
+    if sol is not None:
+        hat_g = sol.get("hat_g", None)
+        P = sol.get("P", None)
+        if hat_g is not None:
+            print("[info] hat_g (assigned goals) shape:", np.asarray(hat_g).shape)
+        if P is not None:
+            print("[info] P provided by assignment_model with shape:", np.asarray(P).shape)
+
 if __name__ == "__main__":
     main()
