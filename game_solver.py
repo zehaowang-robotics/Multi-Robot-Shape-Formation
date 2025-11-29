@@ -591,7 +591,7 @@ class GameSolver:
         # Terminal loss check
         x_T_all = [x_traj_list[k][-1] for k in range(N)]
         term_val = terminal_loss(x_T_all)
-        print("[DEBUG] terminal_loss finite? ", bool(jnp.isfinite(term_val)))
+        # print("[DEBUG] terminal_loss finite? ", bool(jnp.isfinite(term_val)))
 
         # per-agent horizon loss for gradients (sum of runtime + terminal)
         
@@ -752,16 +752,16 @@ class GameSolver:
             t_iter = _now() - t_iter0
 
             # Pretty timing print (ms)
-            print(
-                f"[TIMING] it={it+1:03d} | "
-                f"linearize={t_lin*1e3:7.2f} ms | "
-                f"grads={t_grad*1e3:7.2f} ms | "
-                f"solve={t_solve*1e3:7.2f} ms | "
-                f"update={t_update*1e3:7.2f} ms | "
-                f"rollout={t_roll*1e3:7.2f} ms | "
-                f"monitor={t_monitor*1e3:7.2f} ms | "
-                f"total={t_iter*1e3:7.2f} ms"
-            )
+            # print(
+            #     f"[TIMING] it={it+1:03d} | "
+            #     f"linearize={t_lin*1e3:7.2f} ms | "
+            #     f"grads={t_grad*1e3:7.2f} ms | "
+            #     f"solve={t_solve*1e3:7.2f} ms | "
+            #     f"update={t_update*1e3:7.2f} ms | "
+            #     f"rollout={t_roll*1e3:7.2f} ms | "
+            #     f"monitor={t_monitor*1e3:7.2f} ms | "
+            #     f"total={t_iter*1e3:7.2f} ms"
+            # )
 
         self.solution = dict(
             x_traj_list=x_traj_list,

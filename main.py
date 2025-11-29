@@ -5,8 +5,9 @@ import numpy as np
 import copy
 from robot import Robot
 from environment import Environment
-from basic_utils import visualize_scene, _bounds_rect_from_Ab, _sample_nonoverlapping_poses
+from basic_utils import visualize_scene, visualize_scene_animation, _bounds_rect_from_Ab, _sample_nonoverlapping_poses
 from game_solver import GameSolver
+import time
 
 def _x_from_robot(rb: Robot):
     """Minimal state vector used by GameSolver/iLQR per steering_type."""
@@ -81,10 +82,10 @@ def main():
 
     # 3) MPC parameters
     dt = 0.1
-    T_horizon = 20            # short finite horizon for MPC
-    pos_tol = 0.10            # position tolerance to declare 'reached'
+    T_horizon = 15            # short finite horizon for MPC
+    pos_tol = 0.25            # position tolerance to declare 'reached'
     max_mpc_steps = 300       # safety cap on outer MPC steps
-    vis_every = 1             # set >0 to visualize every k steps (0 disables intermediate viz)
+    vis_every = 0             # set >0 to visualize every k steps (0 disables intermediate viz)
 
     # 4) Initialize GameSolver params (we will reuse and update per MPC step)
     gs = GameSolver(
@@ -97,19 +98,23 @@ def main():
             "environment": env,
             "robots": robots,
             "g": np.asarray(env.goals, dtype=float),
-            "num_iters": 100,     # fewer inner iters per MPC round is typical
+            "num_iters": 20,     # fewer inner iters per MPC round is typical
             "step_size": 1e-3,
         }
     )
 
     # 5) Visualize initial scene
     print("[info] Visualizing initial scene...")
-    visualize_scene(robots, env)
+    visualize_scene(robots, env, filename="scene_initial.png")
+
+    # Initialize list to collect robot snapshots for animation
+    robot_snapshots = [copy.deepcopy(robots)]
 
     # 6) Outer MPC loop
     last_controls = None  # for warm start
     gs.construct_game()
     gs.solve_game(warmup_only=True, do_warmup=True)
+    time_start = time.time()
     for k in range(max_mpc_steps):
         # shift warm start
         if last_controls is not None:
@@ -149,18 +154,36 @@ def main():
 
         print(f"[MPC] step={k:03d}  max_dist={dists.max():.3f}  mean_dist={dists.mean():.3f}  reached={all_reached}")
 
-        # (f) Optional intermediate visualization
+        # (f) Optional intermediate visualization and snapshot collection
         if vis_every and (k % vis_every == 0):
-            visualize_scene(robots, env)
+            visualize_scene(robots, env, filename=f"scene_step_{k}.png")
+            # Collect snapshot for animation
+            robot_snapshots.append(copy.deepcopy(robots))
 
         if all_reached:
             print(f"[MPC] All agents reached goals within tolerance {pos_tol}.")
             break
+    time_end = time.time()
+    print(f"[info] MPC loop took {time_end - time_start:.2f} seconds.")
 
     # 7) Final visualization
     print("[info] Visualizing final scene...")
     robots_final = copy.deepcopy(robots)
-    visualize_scene(robots_final, env)
+    visualize_scene(robots_final, env, filename="scene_final.png")
+    
+    # Add final snapshot to animation (always add to ensure final state is included)
+    robot_snapshots.append(robots_final)
+
+    # 8) Create animation from collected snapshots
+    if len(robot_snapshots) > 1:
+        print("[info] Creating animation from collected snapshots...")
+        visualize_scene_animation(
+            robot_snapshots, 
+            env, 
+            filename="formation_animation.gif",
+            duration=0.15,  # frame duration in seconds
+            step_label=True
+        )
 
     # (optional) print assignment info from last solve
     if sol is not None:
