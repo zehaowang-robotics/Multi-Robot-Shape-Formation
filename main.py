@@ -1,6 +1,7 @@
 # main.py
 from __future__ import annotations
 
+import argparse
 import numpy as np
 import copy
 from robot import Robot
@@ -43,24 +44,78 @@ def _shift_warmstart(u_traj_list):
             out.append(np.vstack([U[1:], pad]))
     return out
 
-def main():
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Multi-robot shape formation simulation using game-theoretic solver"
+    )
+    
+    # Define all arguments in a single data structure
+    arguments = [
+        {"name": ["--assignment-method"], "type": str, "default": "hungarian", "choices": ["greedy", "hungarian", "fair"], "help": "Goal assignment method: greedy, hungarian, or fair (default: hungarian)"},
+        {"name": ["--formation"], "type": str, "default": "U", "choices": ["U", "T", "A", "S", "I", "N"], "help": "Formation shape (default: U)"},
+        {"name": ["--num-robot"], "type": int, "default": 10, "help": "Number of robots (default: 10)"},
+        {"name": ["--xmin", "--x-min"], "type": float, "default": -8.0, "dest": "xmin", "help": "Minimum x coordinate of environment (default: -8.0)"},
+        {"name": ["--ymin", "--y-min"], "type": float, "default": -5.0, "dest": "ymin", "help": "Minimum y coordinate of environment (default: -5.0)"},
+        {"name": ["--xmax", "--x-max"], "type": float, "default": 8.0, "dest": "xmax", "help": "Maximum x coordinate of environment (default: 8.0)"},
+        {"name": ["--ymax", "--y-max"], "type": float, "default": 5.0, "dest": "ymax", "help": "Maximum y coordinate of environment (default: 5.0)"},
+        {"name": ["--dt"], "type": float, "default": 0.1, "help": "Time step (default: 0.1)"},
+        {"name": ["--T-horizon"], "type": int, "default": 15, "dest": "T_horizon", "help": "MPC time horizon (default: 15)"},
+        {"name": ["--pos-tol"], "type": float, "default": 0.25, "dest": "pos_tol", "help": "Position tolerance to declare goal reached (default: 0.25)"},
+        {"name": ["--max-mpc-steps"], "type": int, "default": 300, "dest": "max_mpc_steps", "help": "Maximum MPC steps (default: 300)"},
+        {"name": ["--vis-every"], "type": int, "default": 1, "dest": "vis_every", "help": "Visualize every N steps (0 to disable, default: 1)"},
+        {"name": ["--num-iters"], "type": int, "default": 20, "dest": "num_iters", "help": "Number of inner solver iterations (default: 20)"},
+        {"name": ["--step-size"], "type": float, "default": 1e-3, "dest": "step_size", "help": "Solver step size (default: 1e-3)"},
+        {"name": ["--w-goal"], "type": float, "default": 1.0, "dest": "w_goal", "help": "Weight for goal tracking (default: 1.0)"},
+        {"name": ["--w-collision"], "type": float, "default": 1e3, "dest": "w_collision", "help": "Weight for collision avoidance (default: 1e3)"},
+        {"name": ["--w-control"], "type": float, "default": 0.01, "dest": "w_control", "help": "Weight for control effort (default: 0.01)"},
+        {"name": ["--w-terminal"], "type": float, "default": 1.0, "dest": "w_terminal", "help": "Weight for terminal cost (default: 1.0)"},
+        {"name": ["--radius"], "type": float, "default": 0.40, "dest": "radius_val", "help": "Robot radius (default: 0.40)"},
+        {"name": ["--max-velocity"], "type": float, "default": 2.0, "dest": "max_velocity", "help": "Maximum robot velocity (default: 2.0)"},
+        {"name": ["--max-omega"], "type": float, "default": 2.0, "dest": "max_omega", "help": "Maximum robot angular velocity (default: 2.0)"},
+        {"name": ["--seed"], "type": int, "default": 12345, "help": "Random seed (default: 12345)"},
+        {"name": ["--output-prefix"], "type": str, "default": "", "dest": "output_prefix", "help": "Prefix for output filenames (default: empty)"},
+    ]
+    
+    # Add all arguments using a single pattern
+    for arg in arguments:
+        kwargs = {k: v for k, v in arg.items() if k != "name"}
+        parser.add_argument(*arg["name"], **kwargs)
+    
+    return parser.parse_args()
+
+
+def main(args):
+    """
+    Main function for multi-robot shape formation simulation.
+    
+    Args:
+        args: Parsed command-line arguments from argparse
+    """
+    # Build weights dictionary
+    weights = {
+        "w_goal": args.w_goal,
+        "w_collision": args.w_collision,
+        "w_control": args.w_control,
+        "w_terminal": args.w_terminal,
+    }
+    
     # Reproducibility
-    rng = np.random.default_rng(12345)
+    rng = np.random.default_rng(args.seed)
 
     # 1) Environment and goals
-    env = Environment(formation="U", num_robot=10)
-    env.set_rect_bounds(xmin=-8.0, ymin=-5.0, xmax=8.0, ymax=5.0)
+    env = Environment(formation=args.formation, num_robot=args.num_robot)
+    env.set_rect_bounds(xmin=args.xmin, ymin=args.ymin, xmax=args.xmax, ymax=args.ymax)
 
     # 2) Sample robots
-    N = 10
-    xmin, ymin, xmax, ymax = _bounds_rect_from_Ab(env.bounds)
-    radius_val = 0.40
-    radii = [radius_val for _ in range(N)]
+    N = args.num_robot
+    xmin_env, ymin_env, xmax_env, ymax_env = _bounds_rect_from_Ab(env.bounds)
+    radii = [args.radius_val for _ in range(N)]
     sep_margin = 0.05
 
     xs, ys, thetas = _sample_nonoverlapping_poses(
         n=N,
-        rect=(xmin, ymin, xmax, ymax),
+        rect=(xmin_env, ymin_env, xmax_env, ymax_env),
         radii=radii,
         rng=rng,
         max_trials_per_robot=8000,
@@ -73,39 +128,33 @@ def main():
         r = Robot(
             index=i,
             steering_type="unicycle",
-            params={"radius": radii[i], "max_velocity": 2.0, "max_omega": 2.0},
+            params={"radius": radii[i], "max_velocity": args.max_velocity, "max_omega": args.max_omega},
             state={"x": float(xs[i]), "y": float(ys[i]), "theta": float(thetas[i]), "v": 0.0, "w": 0.0},
         )
         robots.append(r)
 
     print("[info] Sampled initial robot states:")
 
-    # 3) MPC parameters
-    dt = 0.1
-    T_horizon = 15            # short finite horizon for MPC
-    pos_tol = 0.25            # position tolerance to declare 'reached'
-    max_mpc_steps = 300       # safety cap on outer MPC steps
-    vis_every = 0             # set >0 to visualize every k steps (0 disables intermediate viz)
-
-    # 4) Initialize GameSolver params (we will reuse and update per MPC step)
+    # 3) Initialize GameSolver params (we will reuse and update per MPC step)
     gs = GameSolver(
         params={
             "N": N,
-            "dt": dt,
-            "T": T_horizon,
-            "weights": {"w_goal": 1.0, "w_collision": 1e3, "w_control": 0.01, "w_terminal": 1.0},
-            "radius": radius_val,
+            "dt": args.dt,
+            "T": args.T_horizon,
+            "weights": weights,
+            "radius": args.radius_val,
             "environment": env,
             "robots": robots,
             "g": np.asarray(env.goals, dtype=float),
-            "num_iters": 20,     # fewer inner iters per MPC round is typical
-            "step_size": 1e-3,
+            "num_iters": args.num_iters,
+            "step_size": args.step_size,
+            "assignment_method": args.assignment_method,
         }
     )
 
     # 5) Visualize initial scene
     print("[info] Visualizing initial scene...")
-    visualize_scene(robots, env, filename="scene_initial.png")
+    visualize_scene(robots, env, filename=f"{args.output_prefix}scene_initial_{args.assignment_method}.png")
 
     # Initialize list to collect robot snapshots for animation
     robot_snapshots = [copy.deepcopy(robots)]
@@ -115,7 +164,7 @@ def main():
     gs.construct_game()
     gs.solve_game(warmup_only=True, do_warmup=True)
     time_start = time.time()
-    for k in range(max_mpc_steps):
+    for k in range(args.max_mpc_steps):
         # shift warm start
         if last_controls is not None:
             u_warm = _shift_warmstart(last_controls)
@@ -123,14 +172,10 @@ def main():
             u_warm = None
 
         # (b) Refresh game model with current robot states
-        gs.refresh_for_mpc(u_init_list=u_warm, recompute_assignment=True)
+        gs.refresh_for_mpc(u_init_list=u_warm, recompute_assignment=False)
 
         # (c) Solve current finite-horizon game
-        try:
-            gs.solve_game(do_warmup=False)
-        except RuntimeError as e:
-            print(f"[WARN] solve_game failed at MPC step {k}: {e}")
-            break
+        gs.solve_game(do_warmup=False)
 
         sol = gs.solution
         x_traj_list = sol["x_traj_list"]
@@ -147,21 +192,31 @@ def main():
             _apply_state_to_robot(robots[i], x1)
 
         # (e) Check stopping criterion
-        hat_g = np.array(sol["hat_g"])  # (N,2)
+        # Check if all agents are at the formation goals (what's shown in visualization)
+        # The formation is complete when all agents are within tolerance of any formation goal
         pos = np.array([[rb.state["x"], rb.state["y"]] for rb in robots])
-        dists = np.linalg.norm(pos - hat_g, axis=1)
-        all_reached = bool(np.all(dists <= pos_tol))
+        g_all = np.array(env.goals)  # All formation goals
+        
+        # For each agent, find distance to closest formation goal
+        dists = []
+        for i in range(N):
+            dists_to_goals = np.linalg.norm(g_all - pos[i], axis=1)
+            min_dist = np.min(dists_to_goals)
+            dists.append(min_dist)
+        
+        dists = np.array(dists)
+        all_reached = bool(np.all(dists <= args.pos_tol))
 
         print(f"[MPC] step={k:03d}  max_dist={dists.max():.3f}  mean_dist={dists.mean():.3f}  reached={all_reached}")
-
+        
         # (f) Optional intermediate visualization and snapshot collection
-        if vis_every and (k % vis_every == 0):
-            visualize_scene(robots, env, filename=f"scene_step_{k}.png")
+        if args.vis_every and (k % args.vis_every == 0):
+            visualize_scene(robots, env, filename=f"{args.output_prefix}scene_step_{k}_{args.assignment_method}.png")
             # Collect snapshot for animation
             robot_snapshots.append(copy.deepcopy(robots))
 
         if all_reached:
-            print(f"[MPC] All agents reached goals within tolerance {pos_tol}.")
+            print(f"[MPC] All agents reached goals within tolerance {args.pos_tol}. Terminating at step {k}.")
             break
     time_end = time.time()
     print(f"[info] MPC loop took {time_end - time_start:.2f} seconds.")
@@ -169,7 +224,7 @@ def main():
     # 7) Final visualization
     print("[info] Visualizing final scene...")
     robots_final = copy.deepcopy(robots)
-    visualize_scene(robots_final, env, filename="scene_final.png")
+    visualize_scene(robots_final, env, filename=f"{args.output_prefix}scene_final_{args.assignment_method}.png")
     
     # Add final snapshot to animation (always add to ensure final state is included)
     robot_snapshots.append(robots_final)
@@ -180,7 +235,7 @@ def main():
         visualize_scene_animation(
             robot_snapshots, 
             env, 
-            filename="formation_animation.gif",
+            filename=f"{args.output_prefix}formation_animation_{args.assignment_method}.gif",
             duration=0.15,  # frame duration in seconds
             step_label=True
         )
@@ -195,4 +250,5 @@ def main():
             print("[info] P provided by assignment_model with shape:", np.asarray(P).shape)
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args)
