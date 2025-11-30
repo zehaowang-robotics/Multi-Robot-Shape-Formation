@@ -20,39 +20,6 @@ except ImportError:
     SCIPY_MILP_AVAILABLE = False
 
 
-def sinkhorn_normalize(log_P: jnp.ndarray, num_iter: int = 10) -> jnp.ndarray:
-    """
-    Normalize a log-space matrix to be doubly stochastic using Sinkhorn algorithm.
-    
-    Args:
-        log_P: (N, N) matrix in log space
-        num_iter: Number of Sinkhorn iterations
-        
-    Returns:
-        P: (N, N) doubly stochastic matrix (permutation-like)
-    """
-    # Clip log_P to prevent overflow in exp
-    log_P_clipped = jnp.clip(log_P, -50.0, 50.0)
-    
-    # Subtract max for numerical stability
-    log_P_shifted = log_P_clipped - jnp.max(log_P_clipped)
-    
-    P = jnp.exp(log_P_shifted)
-    P = jnp.where(jnp.isfinite(P), P, 1e-10)  # Replace NaN/Inf with small value
-    
-    for _ in range(num_iter):
-        # Normalize rows
-        row_sums = jnp.sum(P, axis=1, keepdims=True) + 1e-10
-        P = P / row_sums
-        # Normalize columns
-        col_sums = jnp.sum(P, axis=0, keepdims=True) + 1e-10
-        P = P / col_sums
-        # Ensure finite
-        P = jnp.where(jnp.isfinite(P), P, 1.0 / P.shape[0])  # Uniform if NaN
-    
-    return P
-
-
 def _hungarian_assignment(x0_xy: np.ndarray, g: np.ndarray) -> np.ndarray:
     """
     Compute goal assignment using Hungarian algorithm (optimal assignment).
@@ -1066,7 +1033,7 @@ class GameSolver:
                 game_solver=self,
             )
             # Optimize P using MIP
-            fair_optimizer.optimize(num_iters=20, verbose=True)
+            fair_optimizer.optimize(num_iters=N, verbose=True)
             # Set as assignment model
             p["assignment_model"] = fair_optimizer
             # Update hat_g

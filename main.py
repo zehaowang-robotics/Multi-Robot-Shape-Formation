@@ -5,7 +5,7 @@ import argparse
 import numpy as np
 import copy
 from robot import Robot
-from environment import Environment
+from environment import Environment, generate_circle_goals
 from basic_utils import visualize_scene, visualize_scene_animation, _bounds_rect_from_Ab, _sample_nonoverlapping_poses
 from game_solver import GameSolver
 import time
@@ -53,7 +53,10 @@ def parse_args():
     # Define all arguments in a single data structure
     arguments = [
         {"name": ["--assignment-method"], "type": str, "default": "hungarian", "choices": ["greedy", "hungarian", "fair"], "help": "Goal assignment method: greedy, hungarian, or fair (default: hungarian)"},
-        {"name": ["--formation"], "type": str, "default": "U", "choices": ["U", "T", "A", "S", "I", "N"], "help": "Formation shape (default: U)"},
+        {"name": ["--formation"], "type": str, "default": "", "choices": ["U", "T", "A", "S", "I", "N",""], "help": "Formation shape for letter formations (default: U)"},
+        {"name": ["--goal-type"], "type": str, "default": "letter", "choices": ["letter", "circle"], "dest": "goal_type", "help": "Goal type: 'letter' for letter formations or 'circle' for circular ring (default: letter)"},
+        {"name": ["--circle-margin"], "type": float, "default": 0.12, "dest": "circle_margin", "help": "Margin fraction for circular goals (default: 0.12)"},
+        {"name": ["--circle-angle-offset"], "type": float, "default": 0.0, "dest": "circle_angle_offset", "help": "Angle offset in radians for circular goals (default: 0.0)"},
         {"name": ["--num-robot"], "type": int, "default": 10, "help": "Number of robots (default: 10)"},
         {"name": ["--xmin", "--x-min"], "type": float, "default": -8.0, "dest": "xmin", "help": "Minimum x coordinate of environment (default: -8.0)"},
         {"name": ["--ymin", "--y-min"], "type": float, "default": -5.0, "dest": "ymin", "help": "Minimum y coordinate of environment (default: -5.0)"},
@@ -61,16 +64,17 @@ def parse_args():
         {"name": ["--ymax", "--y-max"], "type": float, "default": 5.0, "dest": "ymax", "help": "Maximum y coordinate of environment (default: 5.0)"},
         {"name": ["--dt"], "type": float, "default": 0.1, "help": "Time step (default: 0.1)"},
         {"name": ["--T-horizon"], "type": int, "default": 15, "dest": "T_horizon", "help": "MPC time horizon (default: 15)"},
-        {"name": ["--pos-tol"], "type": float, "default": 0.25, "dest": "pos_tol", "help": "Position tolerance to declare goal reached (default: 0.25)"},
-        {"name": ["--max-mpc-steps"], "type": int, "default": 300, "dest": "max_mpc_steps", "help": "Maximum MPC steps (default: 300)"},
+        {"name": ["--pos-tol"], "type": float, "default": 0.3, "dest": "pos_tol", "help": "Position tolerance to declare goal reached (default: 0.25)"},
+        {"name": ["--max-mpc-steps"], "type": int, "default": 50, "dest": "max_mpc_steps", "help": "Maximum MPC steps (default: 300)"},
         {"name": ["--vis-every"], "type": int, "default": 1, "dest": "vis_every", "help": "Visualize every N steps (0 to disable, default: 1)"},
+        {"name": ["--save-step-figures"], "action": "store_true", "dest": "save_step_figures", "help": "Save individual PNG figures for each step (default: False, only saves GIF)"},
         {"name": ["--num-iters"], "type": int, "default": 20, "dest": "num_iters", "help": "Number of inner solver iterations (default: 20)"},
         {"name": ["--step-size"], "type": float, "default": 1e-3, "dest": "step_size", "help": "Solver step size (default: 1e-3)"},
         {"name": ["--w-goal"], "type": float, "default": 1.0, "dest": "w_goal", "help": "Weight for goal tracking (default: 1.0)"},
         {"name": ["--w-collision"], "type": float, "default": 1e3, "dest": "w_collision", "help": "Weight for collision avoidance (default: 1e3)"},
         {"name": ["--w-control"], "type": float, "default": 0.01, "dest": "w_control", "help": "Weight for control effort (default: 0.01)"},
         {"name": ["--w-terminal"], "type": float, "default": 1.0, "dest": "w_terminal", "help": "Weight for terminal cost (default: 1.0)"},
-        {"name": ["--radius"], "type": float, "default": 0.40, "dest": "radius_val", "help": "Robot radius (default: 0.40)"},
+        {"name": ["--radius"], "type": float, "default": 0.25, "dest": "radius_val", "help": "Robot radius (default: 0.40)"},
         {"name": ["--max-velocity"], "type": float, "default": 2.0, "dest": "max_velocity", "help": "Maximum robot velocity (default: 2.0)"},
         {"name": ["--max-omega"], "type": float, "default": 2.0, "dest": "max_omega", "help": "Maximum robot angular velocity (default: 2.0)"},
         {"name": ["--seed"], "type": int, "default": 12345, "help": "Random seed (default: 12345)"},
@@ -104,8 +108,23 @@ def main(args):
     rng = np.random.default_rng(args.seed)
 
     # 1) Environment and goals
+    # Initialize environment (formation parameter only used for letter goals)
     env = Environment(formation=args.formation, num_robot=args.num_robot)
     env.set_rect_bounds(xmin=args.xmin, ymin=args.ymin, xmax=args.xmax, ymax=args.ymax)
+    
+    # Generate goals based on goal type
+    if args.goal_type == "circle":
+        # Generate circular ring goals
+        goals_ring = generate_circle_goals(
+            num_robot=args.num_robot,
+            robot_radius=args.radius_val,
+            bounds=env.bounds,
+            margin_frac=args.circle_margin,
+            angle_offset=args.circle_angle_offset,
+        )
+        env.goals = goals_ring
+        print(f"[info] Generated {len(goals_ring)} circular ring goals.")
+    # else: letter formation goals are already set by Environment.__init__
 
     # 2) Sample robots
     N = args.num_robot
@@ -153,8 +172,11 @@ def main(args):
     )
 
     # 5) Visualize initial scene
-    print("[info] Visualizing initial scene...")
-    visualize_scene(robots, env, filename=f"{args.output_prefix}scene_initial_{args.assignment_method}.png")
+    if args.save_step_figures:
+        print("[info] Visualizing initial scene...")
+        visualize_scene(robots, env, filename=f"{args.output_prefix}scene_initial_{args.assignment_method}_{args.goal_type}_{args.formation}_{args.num_robot}.png")
+    else:
+        print("[info] Preparing for animation (individual step figures will not be saved, only GIF)...")
 
     # Initialize list to collect robot snapshots for animation
     robot_snapshots = [copy.deepcopy(robots)]
@@ -205,14 +227,15 @@ def main(args):
             dists.append(min_dist)
         
         dists = np.array(dists)
-        all_reached = bool(np.all(dists <= args.pos_tol))
+        all_reached = bool(np.all(dists <= args.pos_tol) )
 
         print(f"[MPC] step={k:03d}  max_dist={dists.max():.3f}  mean_dist={dists.mean():.3f}  reached={all_reached}")
         
         # (f) Optional intermediate visualization and snapshot collection
         if args.vis_every and (k % args.vis_every == 0):
-            visualize_scene(robots, env, filename=f"{args.output_prefix}scene_step_{k}_{args.assignment_method}.png")
-            # Collect snapshot for animation
+            if args.save_step_figures:
+                visualize_scene(robots, env, filename=f"{args.output_prefix}scene_step_{k}_{args.assignment_method}_{args.goal_type}_{args.formation}_{args.num_robot}.png")
+            # Collect snapshot for animation (always collect, even if not saving individual figures)
             robot_snapshots.append(copy.deepcopy(robots))
 
         if all_reached:
@@ -222,9 +245,10 @@ def main(args):
     print(f"[info] MPC loop took {time_end - time_start:.2f} seconds.")
 
     # 7) Final visualization
-    print("[info] Visualizing final scene...")
     robots_final = copy.deepcopy(robots)
-    visualize_scene(robots_final, env, filename=f"{args.output_prefix}scene_final_{args.assignment_method}.png")
+    if args.save_step_figures:
+        print("[info] Visualizing final scene...")
+        visualize_scene(robots_final, env, filename=f"{args.output_prefix}scene_final_{args.assignment_method}_{args.goal_type}_{args.formation}_{args.num_robot}.png")
     
     # Add final snapshot to animation (always add to ensure final state is included)
     robot_snapshots.append(robots_final)
@@ -235,7 +259,7 @@ def main(args):
         visualize_scene_animation(
             robot_snapshots, 
             env, 
-            filename=f"{args.output_prefix}formation_animation_{args.assignment_method}.gif",
+            filename=f"{args.output_prefix}formation_animation_{args.assignment_method}_{args.goal_type}_{args.formation}_{args.num_robot}.gif",
             duration=0.15,  # frame duration in seconds
             step_label=True
         )
