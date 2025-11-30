@@ -119,6 +119,72 @@ def _corner_fill_points(bounds: Dict[str, List[List[float]]], k: int) -> List[Po
         pts.append((x, y))
     return pts
 
+def generate_circle_goals(
+    num_robot: int,
+    robot_radius: float,
+    bounds: Dict[str, List[List[float]]],
+    margin_frac: float = 0.12,
+    angle_offset: float = 0.0) -> List[Point]:
+    """
+    Generate a single-ring (circle) of goals uniformly spaced inside `bounds`.
+
+    Rules:
+      1) Neighbor spacing: chord length >= 2 * robot_radius
+         => 2*R*sin(pi/n) >= 2*robot_radius => R >= robot_radius / sin(pi/n).
+      2) Wall clearance: the ring plus robot footprint must fit within `bounds`,
+         leaving a fractional margin `margin_frac` (same convention as _fit_points_to_bounds).
+
+    Returns:
+      List of (x, y) positions with length == num_robot.
+    """
+    import math
+
+    if num_robot <= 0:
+        raise ValueError(f"num_robot must be positive; got {num_robot}.")
+    if robot_radius <= 0:
+        raise ValueError(f"robot_radius must be positive; got {robot_radius}.")
+
+    xmin, ymin, xmax, ymax = _extract_rect(bounds)
+    W = xmax - xmin
+    H = ymax - ymin
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+
+    # Max allowable ring radius from walls (keep margin and robot fully inside).
+    R_max_x = (0.5 - margin_frac) * W - robot_radius
+    R_max_y = (0.5 - margin_frac) * H - robot_radius
+    R_max = max(0.0, min(R_max_x, R_max_y))
+
+    # If only one robot, place it at the center.
+    if num_robot == 1:
+        return [(cx, cy)]
+
+    # Neighbor spacing constraint.
+    sin_term = math.sin(math.pi / num_robot)
+    R_required = float("inf") if sin_term <= 1e-9 else (robot_radius / sin_term)
+
+    # A small safety floor to avoid degenerate radii.
+    R_floor = 10 * robot_radius
+    R = max(R_required, R_floor)
+
+    if R > R_max + 1e-9:
+        raise ValueError(
+            f"Cannot place {num_robot} robots of radius {robot_radius:g} on a ring inside bounds: "
+            f"required R >= {R_required:.3f}, but max allowed is {R_max:.3f}."
+        )
+
+    # Evenly distribute points on the circle.
+    pts: List[Point] = []
+    for k in range(num_robot):
+        theta = angle_offset + 2.0 * math.pi * (k / num_robot)
+        x = cx + R * math.cos(theta)
+        y = cy + R * math.sin(theta)
+        # Final safety clamp within bounds.
+        x = min(max(x, xmin + 1e-6), xmax - 1e-6)
+        y = min(max(y, ymin + 1e-6), ymax - 1e-6)
+        pts.append((x, y))
+    return pts
+
 
 @dataclass
 class Environment:
