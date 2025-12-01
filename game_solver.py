@@ -1090,22 +1090,42 @@ class GameSolver:
 
         # 3) Optionally recompute assignment hat_g (priority: assignment_model > assignment_method)
         if recompute_assignment:
-            if self.params.get("assignment_model", None) is not None:
-                hat_g = self.params["assignment_model"].hat_g(g)
+            assignment_method = self.params.get("assignment_method", "greedy")
+            assignment_model = self.params.get("assignment_model", None)
+            
+            # For "fair" method, always re-optimize when recompute_assignment=True
+            if assignment_method == "fair":
+                if assignment_model is not None and isinstance(assignment_model, FairAssignmentOptimizer):
+                    # Re-optimize the existing fair optimizer with new goals
+                    print("[Fair Assignment] Re-optimizing assignment for new goals...")
+                    assignment_model.optimize(num_iters=2 * gm["N"], verbose=True)
+                    hat_g = assignment_model.hat_g(g)
+                else:
+                    # Create new fair optimizer (shouldn't happen if construct_game was called, but handle it)
+                    print("[Fair Assignment] Creating new optimizer...")
+                    fair_optimizer = FairAssignmentOptimizer(
+                        N=gm["N"],
+                        game_solver=self,
+                    )
+                    fair_optimizer.optimize(num_iters=gm["N"], verbose=True)
+                    self.params["assignment_model"] = fair_optimizer
+                    hat_g = fair_optimizer.hat_g(g)
+            elif assignment_model is not None:
+                # For other methods with existing assignment_model, just use it
+                hat_g = assignment_model.hat_g(g)
             else:
                 # Use assignment method: "greedy" (default) or "hungarian"
-                assignment_method = self.params.get("assignment_method", "greedy")
                 x0_xy = np.stack([np.array(x0[:2]) for x0 in x0_list], axis=0)  # (N,2) as numpy
                 g_np = np.asarray(g)  # ensure numpy array
                 
                 if assignment_method == "hungarian":
                     hat_g_np = _hungarian_assignment(x0_xy, g_np)
+                    hat_g = jnp.asarray(hat_g_np)  # convert back to JAX array
                 elif assignment_method == "greedy":
                     hat_g_np = _greedy_assignment(x0_xy, g_np)
+                    hat_g = jnp.asarray(hat_g_np)  # convert back to JAX array
                 else:
-                    raise ValueError(f"Unknown assignment_method: {assignment_method}. Must be 'greedy' or 'hungarian'")
-                
-                hat_g = jnp.asarray(hat_g_np)  # convert back to JAX array
+                    raise ValueError(f"Unknown assignment_method: {assignment_method}. Must be 'greedy', 'hungarian', or 'fair'")
             gm["hat_g"] = hat_g
 
     def solve_game(self, warmup_only: bool = False, do_warmup: bool = True):

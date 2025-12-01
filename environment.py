@@ -24,17 +24,17 @@ def _normalize_formation(s: str) -> str:
 
 # Minimal letter templates (unit square); each length = minimal readable count.
 LETTER_POINTS: Dict[str, List[Point]] = {
-    # U: unchanged
+    # U (10 pts): symmetric about x=0.5, left column 3, bottom arc 4, right column 3
     "U": [
-        (0.20, 0.85), (0.20, 0.60), (0.20, 0.35),      # left column
-        (0.35, 0.15), (0.50, 0.10), (0.65, 0.15),      # bottom arc (center included)
-        (0.80, 0.35), (0.80, 0.60), (0.80, 0.85),      # right column
+        (0.20, 0.85), (0.20, 0.60), (0.20, 0.35),                # left column (3)
+        (0.30, 0.20), (0.45, 0.15), (0.70, 0.20), (0.55, 0.15),  # bottom arc (4, symmetric about x=0.5)
+        (0.80, 0.35), (0.80, 0.60), (0.80, 0.85),                # right column (3, mirror of left)
     ],
 
-    # T: unchanged
+    # T (10 pts): top bar 5, stem 5
     "T": [
-        (0.15, 0.90), (0.30, 0.90), (0.50, 0.90), (0.70, 0.90), (0.85, 0.90),  # top bar (center included)
-        (0.50, 0.70), (0.50, 0.50), (0.50, 0.30), (0.50, 0.15),                # stem
+        (0.15, 0.90), (0.30, 0.90), (0.50, 0.90), (0.70, 0.90), (0.85, 0.90),  # top bar (5)
+        (0.50, 0.75), (0.50, 0.60), (0.50, 0.45), (0.50, 0.30), (0.50, 0.15),  # stem (5)
     ],
 
     # A (10 pts): top 1, upper-mid 2, mid 3, lower-mid 2, bottom 2
@@ -47,35 +47,34 @@ LETTER_POINTS: Dict[str, List[Point]] = {
         (0.28, 0.12), (0.72, 0.12),            # bottom corners - 2
     ],
 
-    # S (9 pts): evenly spaced along an S-shaped path (top-right → mid-left → bottom-left)
-    # Chosen to read cleanly after bounds fitting; gentle curvature with fewer points.
+    # S (10 pts): symmetric about center (0.5, 0.5), top half 5, bottom half 5
+    # For point (x, y), mirror is (1-x, 1-y) about center (0.5, 0.5)
     "S": [
-        (0.70, 0.85),  # 1 top-right bulge
-        (0.50, 0.95),  # 2 upper-left shoulder
-        (0.30, 0.85),  # 3 mid-left dip
-        (0.30, 0.60),  # 4 near-center on right
-        (0.50, 0.50),  # 5 CENTER (symmetry point)
-        (0.70, 0.40),  # 6 = 2*center - 4
-        (0.70, 0.15),  # 7 = 2*center - 3
-        (0.50, 0.05),  # 8 = 2*center - 2
-        (0.30, 0.15),  # 9 = 2*center - 1
+        (0.70, 0.85),  # 1 top-right bulge -> mirrors to (0.30, 0.15)
+        (0.50, 0.95),  # 2 top-center -> mirrors to (0.50, 0.05)
+        (0.30, 0.85),  # 3 top-left -> mirrors to (0.70, 0.15)
+        (0.30, 0.70),  # 4 upper-left curve -> mirrors to (0.70, 0.30)
+        (0.43, 0.60),  # 5 upper-center -> mirrors to (0.50, 0.40)
+        (0.57, 0.40),  # 6 lower-center (mirror of 5: 1-0.5=0.5, 1-0.6=0.4)
+        (0.70, 0.30),  # 7 lower-right curve (mirror of 4: 1-0.3=0.7, 1-0.7=0.3)
+        (0.70, 0.15),  # 8 bottom-right (mirror of 3: 1-0.3=0.7, 1-0.85=0.15)
+        (0.50, 0.05),  # 9 bottom-center (mirror of 2: 1-0.5=0.5, 1-0.95=0.05)
+        (0.30, 0.15),  # 10 bottom-left bulge (mirror of 1: 1-0.7=0.3, 1-0.85=0.15)
     ],
 
-    # I (8 pts): top short bar 3, vertical 2, bottom short bar 3
-    # Keep short bars inside bounds; centered vertical spine.
+    # I (10 pts): top bar 3, vertical 4, bottom bar 3
     "I": [
         (0.35, 0.90), (0.50, 0.90), (0.65, 0.90),  # top bar (3)
-        (0.50, 0.60), (0.50, 0.40),                # vertical (2)
+        (0.50, 0.75), (0.50, 0.60), (0.50, 0.45), (0.50, 0.30),  # vertical (4)
         (0.35, 0.10), (0.50, 0.10), (0.65, 0.10),  # bottom bar (3)
     ],
 
-    # N (8 pts): left column 3, diagonal 2, right column 3
-    # Diagonal rises from left-bottom to right-top; columns near margins.
+    # N (10 pts): left column 4, diagonal 3, right column 3
     "N": [
-        # left column (3) -- x = 0.25
-        (0.25, 0.12), (0.25, 0.50), (0.25, 0.88),
-        # diagonal (2) -- from left-bottom toward right-top
-        (0.42, 0.34), (0.58, 0.66),
+        # left column (4) -- x = 0.25
+        (0.25, 0.12), (0.25, 0.38), (0.25, 0.64), (0.25, 0.88),
+        # diagonal (3) -- from left-bottom toward right-top
+        (0.42, 0.34), (0.50, 0.50), (0.58, 0.66),
         # right column (3) -- x = 0.75 (mirror of left)
         (0.75, 0.12), (0.75, 0.50), (0.75, 0.88),
     ],

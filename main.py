@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 import copy
 import time
+import json
 from robot import Robot
 from environment import Environment, generate_circle_goals
 from basic_utils import (
@@ -161,14 +162,10 @@ def _update_goals_in_solver(gs: GameSolver, env: Environment):
 
 def main(args):
     """
-    Main function: randomize initial robots, then sequentially switch formations
-    through a specified letter sequence (e.g., UTAUSTIN).
+    Main function: randomize initial robots, then either:
+    - For letter goals: sequentially switch formations through a specified letter sequence (e.g., UTAUSTIN).
+    - For circle goals: form the circle and end (no switching).
     """
-    # Safety: sequence mode requires letter goals
-    if args.goal_type != "letter":
-        print("[warn] --goal-type was not 'letter'; forcing to 'letter' for sequence mode.")
-        args.goal_type = "letter"
-
     # Build weights
     weights = {
         "w_goal": args.w_goal,
@@ -183,17 +180,34 @@ def main(args):
     env = Environment(formation=args.formation, num_robot=args.num_robot)
     env.set_rect_bounds(xmin=args.xmin, ymin=args.ymin, xmax=args.xmax, ymax=args.ymax)
 
-    # Normalize and pick initial letter from sequence
-    seq_letters = _normalize_sequence(args.formation_seq) or ["U"]
-    seq_len = len(seq_letters)
-    if args.random_start_in_seq:
-        seq_idx = int(rng.integers(0, seq_len))
+    # Handle circle goals separately (no sequence switching)
+    if args.goal_type == "circle":
+        # Generate circular ring goals
+        goals_ring = generate_circle_goals(
+            num_robot=args.num_robot,
+            robot_radius=args.radius_val,
+            bounds=env.bounds,
+            margin_frac=args.circle_margin,
+            angle_offset=args.circle_angle_offset,
+        )
+        env.goals = goals_ring
+        print(f"[info] Generated {len(goals_ring)} circular ring goals (no sequence switching).")
+        # Skip sequence logic for circles
+        seq_letters = None
+        seq_len = 0
+        seq_idx = 0
     else:
-        seq_idx = 0  # start from first letter of sequence
+        # Letter goals: set up sequence
+        seq_letters = _normalize_sequence(args.formation_seq) or ["U"]
+        seq_len = len(seq_letters)
+        if args.random_start_in_seq:
+            seq_idx = int(rng.integers(0, seq_len))
+        else:
+            seq_idx = 0  # start from first letter of sequence
 
-    # Force environment to the chosen initial letter (regenerate goals)
-    env.change_formation(seq_letters[seq_idx], num_robot=args.num_robot)
-    print(f"[info] Initial formation set to: {env.formation} (seq index {seq_idx}/{seq_len-1})")
+        # Force environment to the chosen initial letter (regenerate goals)
+        env.change_formation(seq_letters[seq_idx], num_robot=args.num_robot)
+        print(f"[info] Initial formation set to: {env.formation} (seq index {seq_idx}/{seq_len-1})")
 
     # === 2) Randomly sample initial robot poses (non-overlapping circles) ===
     N = args.num_robot
@@ -243,17 +257,21 @@ def main(args):
     # === 4) Initial visualization ===
     if args.save_step_figures:
         print("[info] Visualizing initial scene...")
-        visualize_scene(
-            robots, env,
-            filename=f"{args.output_prefix}scene_initial_seq_{args.formation_seq}_N{args.num_robot}.png"
-        )
+        if args.goal_type == "circle":
+            filename = f"{args.output_prefix}scene_initial_circle_N{args.num_robot}.png"
+        else:
+            filename = f"{args.output_prefix}scene_initial_seq_{args.formation_seq}_N{args.num_robot}.png"
+        visualize_scene(robots, env, filename=filename)
     else:
         print("[info] Preparing animation...")
 
     # Collect snapshots for GIF
     robot_snapshots = [copy.deepcopy(robots)]
     goals_snapshots = [np.array(env.goals, dtype=float)]
-    formation_labels = [env.formation]
+    if args.goal_type == "letter":
+        formation_labels = [env.formation]
+    else:
+        formation_labels = ["circle"]
 
     # === 5) Warmup once (if solver supports it) ===
     gs.construct_game()
@@ -263,9 +281,32 @@ def main(args):
     last_controls = None
     time_start = time.time()
 
-    # Book-keeping for sequence finish
+    # Book-keeping for sequence finish (only for letter goals)
     finished_once = False
     force_reassign_for_next = False
+    
+    # Trajectory logging: store actual executed trajectories
+    # Format: trajectories[agent_id][step] = {"x": float, "y": float, "theta": float, ...}
+    trajectories = {i: [] for i in range(N)}
+    
+    # Log initial state (before MPC loop)
+    for i in range(N):
+        rb = robots[i]
+        state_dict = {
+            "step": -1,  # -1 indicates initial state
+            "x": float(rb.state["x"]),
+            "y": float(rb.state["y"]),
+            "theta": float(rb.state.get("theta", 0.0)),
+        }
+        if "v" in rb.state:
+            state_dict["v"] = float(rb.state["v"])
+        if "w" in rb.state:
+            state_dict["w"] = float(rb.state["w"])
+        if "v_x" in rb.state:
+            state_dict["v_x"] = float(rb.state["v_x"])
+        if "v_y" in rb.state:
+            state_dict["v_y"] = float(rb.state["v_y"])
+        trajectories[i].append(state_dict)
     
     for k in range(args.max_mpc_steps):
         # Warm start controls
@@ -289,6 +330,25 @@ def main(args):
             u0 = np.array(u_traj_list[i][0])
             x1 = np.array(dyn_list[i](x0_list[i], u0))
             _apply_state_to_robot(robots[i], x1)
+            
+            # Log actual trajectory state
+            rb = robots[i]
+            state_dict = {
+                "step": k,
+                "x": float(rb.state["x"]),
+                "y": float(rb.state["y"]),
+                "theta": float(rb.state.get("theta", 0.0)),
+            }
+            # Add velocity information if available
+            if "v" in rb.state:
+                state_dict["v"] = float(rb.state["v"])
+            if "w" in rb.state:
+                state_dict["w"] = float(rb.state["w"])
+            if "v_x" in rb.state:
+                state_dict["v_x"] = float(rb.state["v_x"])
+            if "v_y" in rb.state:
+                state_dict["v_y"] = float(rb.state["v_y"])
+            trajectories[i].append(state_dict)
 
         # Check distance-to-goal
         pos = np.array([[rb.state["x"], rb.state["y"]] for rb in robots])
@@ -301,77 +361,129 @@ def main(args):
         # Visualization & snapshot
         if args.vis_every and (k % args.vis_every == 0):
             if args.save_step_figures:
-                visualize_scene(
-                    robots, env,
-                    filename=f"{args.output_prefix}scene_step_{k}_{env.formation}_N{args.num_robot}.png"
-                )
+                if args.goal_type == "circle":
+                    filename = f"{args.output_prefix}scene_step_{k}_circle_N{args.num_robot}.png"
+                else:
+                    filename = f"{args.output_prefix}scene_step_{k}_{env.formation}_N{args.num_robot}.png"
+                visualize_scene(robots, env, filename=filename)
             robot_snapshots.append(copy.deepcopy(robots))
             goals_snapshots.append(np.array(env.goals, dtype=float))
-            formation_labels.append(env.formation)
-
-        # === Switching policy ===
-        need_switch = False
-        if args.switch_on == "reach":
-            need_switch = all_reached
-        elif args.switch_on == "interval":
-            need_switch = (k > 0 and (k % args.switch_every == 0))
-
-        if need_switch:
-            # Move to next letter in sequence
-            next_idx = (seq_idx + 1) % seq_len
-            if next_idx == 0 and not args.loop_formation:
-                # Sequence finished once; stop if not looping
-                finished_once = True
+            if args.goal_type == "letter":
+                formation_labels.append(env.formation)
             else:
-                seq_idx = next_idx
+                formation_labels.append("circle")
 
-            if finished_once:
-                print(f"[MPC] Sequence '{args.formation_seq}' completed. Terminating.")
+        # === Switching policy (only for letter goals) ===
+        if args.goal_type == "letter":
+            need_switch = False
+            if args.switch_on == "reach":
+                need_switch = all_reached
+            elif args.switch_on == "interval":
+                need_switch = (k > 0 and (k % args.switch_every == 0))
+
+            if need_switch:
+                # Move to next letter in sequence
+                next_idx = (seq_idx + 1) % seq_len
+                if next_idx == 0 and not args.loop_formation:
+                    # Sequence finished once; stop if not looping
+                    finished_once = True
+                else:
+                    seq_idx = next_idx
+
+                if finished_once:
+                    print(f"[MPC] Sequence '{args.formation_seq}' completed. Terminating.")
+                    break
+
+                # Change environment formation & goals
+                next_letter = seq_letters[seq_idx]
+                env.change_formation(next_letter, num_robot=N)
+                print(f"[info] Switched formation -> {env.formation} (seq index {seq_idx}/{seq_len-1})")
+
+                # Push new goals into solver safely
+                _update_goals_in_solver(gs, env)
+                gs.construct_game()                 # rebuild graph so costs/constraints bind to new goals
+                last_controls = None                # drop warm-start after big goal jump
+                force_reassign_for_next = True      # force re-run Hungarian/fair/etc. at next refresh
+
+                # Keep a snapshot right after switching (for smoother GIF)
+                robot_snapshots.append(copy.deepcopy(robots))
+                goals_snapshots.append(np.array(env.goals, dtype=float))
+                formation_labels.append(env.formation)
+
+            # Early stop if everything reached and no switching requested
+            if all_reached and args.switch_on != "reach":
+                print(f"[MPC] All agents reached current goals; no switch policy active. Terminating.")
                 break
-
-            # Change environment formation & goals
-            next_letter = seq_letters[seq_idx]
-            env.change_formation(next_letter, num_robot=N)
-            print(f"[info] Switched formation -> {env.formation} (seq index {seq_idx}/{seq_len-1})")
-
-            # Push new goals into solver safely
-            _update_goals_in_solver(gs, env)
-            gs.construct_game()                 # rebuild graph so costs/constraints bind to new goals
-            last_controls = None                # drop warm-start after big goal jump
-            force_reassign_for_next = True      # force re-run Hungarian/fair/etc. at next refresh
-
-            # Keep a snapshot right after switching (for smoother GIF)
-            robot_snapshots.append(copy.deepcopy(robots))
-            goals_snapshots.append(np.array(env.goals, dtype=float))
-            formation_labels.append(env.formation)
-
-        # Early stop if everything reached and no switching requested
-        if all_reached and args.switch_on != "reach":
-            print(f"[MPC] All agents reached current goals; no switch policy active. Terminating.")
-            break
+        else:
+            # For circle goals: just end when all agents reach goals
+            if all_reached:
+                print(f"[MPC] All agents reached circle formation. Terminating.")
+                break
 
     time_end = time.time()
     print(f"[info] MPC loop took {time_end - time_start:.2f} seconds.")
+
+    # Save trajectories to JSON file
+    # Convert goals to JSON-serializable format
+    initial_goals = [[float(g[0]), float(g[1])] for g in env.goals] if hasattr(env, "goals") and env.goals else []
+    final_goals = [[float(g[0]), float(g[1])] for g in env.goals] if hasattr(env, "goals") and env.goals else []
+    
+    trajectory_data = {
+        "metadata": {
+            "num_agents": N,
+            "num_steps": len(trajectories[0]) if trajectories[0] else 0,
+            "goal_type": args.goal_type,
+            "assignment_method": args.assignment_method,
+            "formation_seq": args.formation_seq if args.goal_type == "letter" else "circle",
+            "dt": args.dt,
+            "T_horizon": args.T_horizon,
+            "pos_tol": args.pos_tol,
+            "total_time_seconds": float(time_end - time_start),
+        },
+        "goals": {
+            "initial": initial_goals,
+            "final": final_goals,
+        },
+        "trajectories": trajectories,
+    }
+    
+    # Generate output filename
+    if args.goal_type == "circle":
+        traj_filename = f"{args.output_prefix}trajectories_{args.assignment_method}_circle_N{args.num_robot}.json"
+    else:
+        traj_filename = f"{args.output_prefix}trajectories_{args.assignment_method}_{args.formation_seq}_N{args.num_robot}.json"
+    
+    with open(traj_filename, "w") as f:
+        json.dump(trajectory_data, f, indent=2)
+    print(f"[info] Saved trajectories to {traj_filename}")
 
     # Final visualization
     robots_final = copy.deepcopy(robots)
     if args.save_step_figures:
         print("[info] Visualizing final scene...")
-        visualize_scene(
-            robots_final, env,
-            filename=f"{args.output_prefix}scene_final_{env.formation}_N{args.num_robot}.png"
-        )
+        if args.goal_type == "circle":
+            filename = f"{args.output_prefix}scene_final_circle_N{args.num_robot}.png"
+        else:
+            filename = f"{args.output_prefix}scene_final_{env.formation}_N{args.num_robot}.png"
+        visualize_scene(robots_final, env, filename=filename)
     robot_snapshots.append(robots_final)
     goals_snapshots.append(np.array(env.goals, dtype=float))
-    formation_labels.append(env.formation)
+    if args.goal_type == "letter":
+        formation_labels.append(env.formation)
+    else:
+        formation_labels.append("circle")
 
     # Build GIF
     if len(robot_snapshots) > 1:
         print("[info] Creating animation from collected snapshots...")
+        if args.goal_type == "circle":
+            filename = f"{args.output_prefix}formation_animation_{args.assignment_method}_circle_N{args.num_robot}.gif"
+        else:
+            filename = f"{args.output_prefix}formation_animation_{args.assignment_method}_{args.formation_seq}_N{args.num_robot}.gif"
         visualize_scene_animation(
             robot_snapshots,
             env,
-            filename=f"{args.output_prefix}formation_animation_SEQ_{args.formation_seq}_N{args.num_robot}.gif",
+            filename=filename,
             duration=0.15,
             step_label=True,
             goals_snapshots=goals_snapshots,          # NEW

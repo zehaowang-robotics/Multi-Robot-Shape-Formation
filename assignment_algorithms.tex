@@ -1,0 +1,383 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\geometry{margin=1in}
+
+% Customize algorithmic package
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+\renewcommand{\algorithmiccomment}[1]{\hfill \textit{// #1}}
+
+\title{Goal Assignment Algorithms for Multi-Robot Formation Control}
+\author{Pseudocode Documentation}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+This document provides pseudocode for three goal assignment algorithms used in multi-robot formation control:
+\begin{enumerate}
+    \item \textbf{Greedy Assignment} --- Fast nearest-neighbor heuristic
+    \item \textbf{Hungarian Assignment} --- Optimal total distance minimization
+    \item \textbf{MIP Fair Assignment} --- Optimal minimax fairness
+\end{enumerate}
+
+\subsection{Problem Formulation}
+
+Given:
+\begin{itemize}
+    \item $N$ agents with initial positions $\mathbf{x}_0[i] \in \mathbb{R}^2$ for $i \in \{0, \ldots, N-1\}$
+    \item $N$ goals with positions $\mathbf{g}[j] \in \mathbb{R}^2$ for $j \in \{0, \ldots, N-1\}$
+\end{itemize}
+
+Find a permutation (one-to-one assignment) that maps each agent to exactly one goal, producing assigned goals $\hat{\mathbf{g}}[i]$ for each agent $i$.
+
+\section{Greedy Assignment Algorithm}
+
+\subsection{Overview}
+
+The greedy algorithm assigns each agent to its nearest unassigned goal in a sequential manner. This is a fast heuristic that runs in $O(N^2 \log N)$ time but does not guarantee optimality.
+
+\subsection{Objective}
+
+Minimize individual agent distances (greedy local optimization).
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{Greedy Assignment}
+\begin{algorithmic}[1]
+\REQUIRE $\mathbf{x}_0$: $(N, 2)$ agent initial positions; $\mathbf{g}$: $(N, 2)$ goal positions
+\ENSURE $\hat{\mathbf{g}}$: $(N, 2)$ assigned goals for each agent
+\STATE $N \gets \text{length}(\mathbf{x}_0)$
+\STATE $\text{used} \gets \emptyset$ \COMMENT{Track assigned goals}
+\STATE $\hat{\mathbf{g}} \gets []$ \COMMENT{Initialize empty list}
+\FOR{$i = 0$ \TO $N-1$}
+    \STATE \COMMENT{Compute distances from agent $i$ to all goals}
+    \STATE $\mathbf{d} \gets []$
+    \FOR{$j = 0$ \TO $N-1$}
+        \STATE $\mathbf{d}[j] \gets \|\mathbf{g}[j] - \mathbf{x}_0[i]\|$ \COMMENT{Euclidean distance}
+    \ENDFOR
+    \STATE \COMMENT{Sort goals by distance (ascending)}
+    \STATE $\text{order} \gets \text{argsort}(\mathbf{d})$ \COMMENT{Indices sorted by distance}
+    \STATE \COMMENT{Find nearest unassigned goal}
+    \STATE $\text{chosen} \gets \text{None}$
+    \FOR{$\text{idx} \in \text{order}$}
+        \IF{$\text{idx} \notin \text{used}$}
+            \STATE $\text{chosen} \gets \text{idx}$
+            \STATE \textbf{break}
+        \ENDIF
+    \ENDFOR
+    \STATE \COMMENT{Fallback: if all goals used (shouldn't happen), use nearest}
+    \IF{$\text{chosen} = \text{None}$}
+        \STATE $\text{chosen} \gets \text{order}[0]$
+    \ENDIF
+    \STATE \COMMENT{Assign goal to agent}
+    \STATE $\text{used}.\text{add}(\text{chosen})$
+    \STATE $\hat{\mathbf{g}}[i] \gets \mathbf{g}[\text{chosen}]$
+\ENDFOR
+\RETURN $\text{stack}(\hat{\mathbf{g}})$ \COMMENT{Convert to $(N, 2)$ array}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity}
+
+\begin{itemize}
+    \item \textbf{Time}: $O(N^2 \log N)$ --- For each agent, compute $N$ distances and sort
+    \item \textbf{Space}: $O(N)$ --- Store used set and output
+\end{itemize}
+
+\section{Hungarian Assignment Algorithm}
+
+\subsection{Overview}
+
+The Hungarian algorithm (Kuhn--Munkres algorithm) solves the assignment problem optimally. It finds the assignment that minimizes the total distance from all agents to their assigned goals.
+
+\subsection{Objective}
+
+Minimize: $\sum_{i=0}^{N-1} \|\hat{\mathbf{g}}[i] - \mathbf{x}_0[i]\|$ (total distance)
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{Hungarian Assignment}
+\begin{algorithmic}[1]
+\REQUIRE $\mathbf{x}_0$: $(N, 2)$ agent initial positions; $\mathbf{g}$: $(N, 2)$ goal positions
+\ENSURE $\hat{\mathbf{g}}$: $(N, 2)$ assigned goals for each agent
+\STATE $N \gets \text{length}(\mathbf{x}_0)$
+\STATE \COMMENT{Build cost matrix: $\text{cost}[i, j] = \text{distance from agent } i \text{ to goal } j$}
+\STATE $\text{cost\_matrix} \gets \mathbf{0}_{N \times N}$
+\FOR{$i = 0$ \TO $N-1$}
+    \FOR{$j = 0$ \TO $N-1$}
+        \STATE $\text{cost\_matrix}[i, j] \gets \|\mathbf{g}[j] - \mathbf{x}_0[i]\|$ \COMMENT{Euclidean distance}
+    \ENDFOR
+\ENDFOR
+\STATE \COMMENT{Vectorized version (more efficient):}
+\STATE \COMMENT{$\mathbf{diff} \gets \mathbf{x}_0[:, \text{None}, :] - \mathbf{g}[\text{None}, :, :]$ (Shape: $(N, N, 2)$)}
+\STATE \COMMENT{$\text{cost\_matrix} \gets \|\mathbf{diff}\|$ along axis $=2$ (Shape: $(N, N)$)}
+\STATE \COMMENT{Solve assignment problem using Hungarian algorithm}
+\STATE \COMMENT{This finds $\text{row\_indices}$ and $\text{col\_indices}$ such that:}
+\STATE \COMMENT{$\text{row\_indices}[i]$ is the agent index}
+\STATE \COMMENT{$\text{col\_indices}[i]$ is the assigned goal index}
+\STATE \COMMENT{The assignment minimizes $\sum_i \text{cost\_matrix}[\text{row\_indices}[i], \text{col\_indices}[i]]$}
+\STATE $(\text{row\_indices}, \text{col\_indices}) \gets \text{linear\_sum\_assignment}(\text{cost\_matrix})$
+\STATE \COMMENT{Build assigned goals array}
+\STATE $\hat{\mathbf{g}} \gets \mathbf{0}_{N \times 2}$
+\FOR{$k = 0$ \TO $\text{length}(\text{row\_indices})-1$}
+    \STATE $\text{agent\_idx} \gets \text{row\_indices}[k]$
+    \STATE $\text{goal\_idx} \gets \text{col\_indices}[k]$
+    \STATE $\hat{\mathbf{g}}[\text{agent\_idx}] \gets \mathbf{g}[\text{goal\_idx}]$
+\ENDFOR
+\RETURN $\hat{\mathbf{g}}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity}
+
+\begin{itemize}
+    \item \textbf{Time}: $O(N^3)$ --- Standard Hungarian algorithm complexity
+    \item \textbf{Space}: $O(N^2)$ --- Cost matrix storage
+\end{itemize}
+
+\section{MIP Fair Assignment Algorithm}
+
+\subsection{Overview}
+
+This algorithm uses Mixed Integer Programming (MIP) to find a permutation matrix $\mathbf{P}$ that minimizes the maximum agent cost (minimax objective), ensuring fairness across all agents.
+
+\subsection{Objective}
+
+Find a permutation matrix $\mathbf{P} \in \{0,1\}^{N \times N}$ that minimizes:
+\[
+\max_i (\text{cost}_i)
+\]
+where $\text{cost}_i$ is the total game cost for agent $i$ when assigned to goal $\mathbf{P} \mathbf{g}[i]$.
+
+\subsection{Constraints}
+
+\begin{align}
+\sum_j \mathbf{P}[i,j] &= 1 \quad \forall i \in \{1, \ldots, N\} \quad \text{(each agent assigned to exactly one goal)} \\
+\sum_i \mathbf{P}[i,j] &= 1 \quad \forall j \in \{1, \ldots, N\} \quad \text{(each goal assigned to exactly one agent)}
+\end{align}
+
+\subsection{Main Optimization Loop}
+
+\begin{algorithm}[H]
+\caption{MIP Fair Goal Assignment}
+\begin{algorithmic}[1]
+\REQUIRE $N$: number of agents/goals; $\mathbf{x}_0$: initial agent positions $(N, 2)$; $\mathbf{g}$: goal positions $(N, 2)$; $\text{game\_solver}$: game-theoretic solver instance; $\text{num\_iters}$: number of MIP iterations
+\ENSURE $\mathbf{P}^*$: optimal permutation matrix $(N, N)$; $\hat{\mathbf{g}}$: assigned goals $(N, 2) = \mathbf{P}^* \mathbf{g}$
+\STATE \COMMENT{Initialize with Hungarian assignment (baseline)}
+\STATE $\text{dist\_matrix} \gets \text{compute\_pairwise\_distances}(\mathbf{x}_0, \mathbf{g})$ \COMMENT{$(N, N)$}
+\STATE $\mathbf{P}_{\text{init}} \gets \text{Hungarian\_Assignment}(\text{dist\_matrix})$
+\STATE $\text{costs}_{\text{init}} \gets \text{Evaluate\_Game\_Costs}(\mathbf{P}_{\text{init}}, \text{game\_solver})$
+\STATE $\mathbf{P}_{\text{best}} \gets \mathbf{P}_{\text{init}}$
+\STATE $\text{best\_max\_cost} \gets \max(\text{costs}_{\text{init}})$
+\STATE \COMMENT{Initialize evaluation pool}
+\STATE $\text{evaluated\_pool} \gets \{\}$
+\STATE $\text{evaluated\_pool}[\text{P\_to\_key}(\mathbf{P}_{\text{init}})] \gets (\mathbf{P}_{\text{init}}, \text{costs}_{\text{init}}, \max(\text{costs}_{\text{init}}))$
+\STATE \COMMENT{Iterative MIP refinement}
+\FOR{$\text{iteration} = 1$ \TO $\text{num\_iters}$}
+    \STATE \COMMENT{Update cost matrix from evaluated pool}
+    \STATE $\text{cost\_matrix} \gets \text{Update\_Cost\_Matrix}(\text{evaluated\_pool}, \text{dist\_matrix})$
+    \STATE \COMMENT{Solve MIP to find candidate assignment}
+    \STATE $\mathbf{P}_{\text{candidate}} \gets \text{MIP\_Optimize\_Minimax}(\text{cost\_matrix})$
+    \STATE \COMMENT{Skip if already evaluated}
+    \IF{$\mathbf{P}_{\text{candidate}} \in \text{evaluated\_pool}$}
+        \STATE \textbf{continue}
+    \ENDIF
+    \STATE \COMMENT{Evaluate candidate via game solver}
+    \STATE $\text{costs}_{\text{candidate}} \gets \text{Evaluate\_Game\_Costs}(\mathbf{P}_{\text{candidate}}, \text{game\_solver})$
+    \STATE $\text{max\_cost}_{\text{candidate}} \gets \max(\text{costs}_{\text{candidate}})$
+    \STATE \COMMENT{Add to pool}
+    \STATE $\text{evaluated\_pool}[\text{P\_to\_key}(\mathbf{P}_{\text{candidate}})] \gets (\mathbf{P}_{\text{candidate}}, \text{costs}_{\text{candidate}}, \text{max\_cost}_{\text{candidate}})$
+    \STATE \COMMENT{Update best if improved}
+    \IF{$\text{max\_cost}_{\text{candidate}} < \text{best\_max\_cost}$}
+        \STATE $\mathbf{P}_{\text{best}} \gets \mathbf{P}_{\text{candidate}}$
+        \STATE $\text{best\_max\_cost} \gets \text{max\_cost}_{\text{candidate}}$
+    \ENDIF
+\ENDFOR
+\RETURN $\mathbf{P}_{\text{best}}$, $\mathbf{P}_{\text{best}} \mathbf{g}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{MIP Optimization Subroutine}
+
+\begin{algorithm}[H]
+\caption{MIP\_Optimize\_Minimax}
+\begin{algorithmic}[1]
+\REQUIRE $\text{cost\_matrix}$: $(N, N)$ estimated costs for each agent-goal pair
+\ENSURE $\mathbf{P}$: $(N, N)$ permutation matrix
+\STATE \COMMENT{Variables: $\mathbf{P}[i,j] \in \{0,1\}$ for all $i,j$, plus $z \in \mathbb{R}$ (for minimax)}
+\STATE $n_{\text{vars}} \gets N \times N + 1$
+\STATE \COMMENT{Objective: minimize $z$ (the maximum cost)}
+\STATE $\mathbf{c} \gets [0, \ldots, 0, 1]$ \COMMENT{Last element is $z$}
+\STATE \COMMENT{Variable bounds}
+\STATE $\text{integrality} \gets [1, \ldots, 1, 0]$ \COMMENT{$\mathbf{P}$ binary, $z$ continuous}
+\STATE $\text{bounds}.\text{lb} \gets [0, \ldots, 0, 0]$
+\STATE $\text{bounds}.\text{ub} \gets [1, \ldots, 1, \infty]$
+\STATE \COMMENT{Constraints}
+\STATE $\mathbf{A} \gets \mathbf{0}_{(2N + N) \times n_{\text{vars}}}$
+\STATE $\mathbf{b}_{\text{lower}} \gets \mathbf{0}_{2N + N}$
+\STATE $\mathbf{b}_{\text{upper}} \gets \mathbf{0}_{2N + N}$
+\STATE $\text{constraint\_idx} \gets 0$
+\STATE \COMMENT{Row constraints: $\sum_j \mathbf{P}[i,j] = 1$}
+\FOR{$i = 1$ \TO $N$}
+    \FOR{$j = 1$ \TO $N$}
+        \STATE $\mathbf{A}[\text{constraint\_idx}, i \times N + j] \gets 1.0$
+    \ENDFOR
+    \STATE $\mathbf{b}_{\text{lower}}[\text{constraint\_idx}] \gets 1.0$
+    \STATE $\mathbf{b}_{\text{upper}}[\text{constraint\_idx}] \gets 1.0$
+    \STATE $\text{constraint\_idx} \gets \text{constraint\_idx} + 1$
+\ENDFOR
+\STATE \COMMENT{Column constraints: $\sum_i \mathbf{P}[i,j] = 1$}
+\FOR{$j = 1$ \TO $N$}
+    \FOR{$i = 1$ \TO $N$}
+        \STATE $\mathbf{A}[\text{constraint\_idx}, i \times N + j] \gets 1.0$
+    \ENDFOR
+    \STATE $\mathbf{b}_{\text{lower}}[\text{constraint\_idx}] \gets 1.0$
+    \STATE $\mathbf{b}_{\text{upper}}[\text{constraint\_idx}] \gets 1.0$
+    \STATE $\text{constraint\_idx} \gets \text{constraint\_idx} + 1$
+\ENDFOR
+\STATE \COMMENT{Minimax constraints: $\sum_j \mathbf{P}[i,j] \times \text{cost\_matrix}[i,j] \leq z$}
+\FOR{$i = 1$ \TO $N$}
+    \FOR{$j = 1$ \TO $N$}
+        \STATE $\mathbf{A}[\text{constraint\_idx}, i \times N + j] \gets \text{cost\_matrix}[i, j]$
+    \ENDFOR
+    \STATE $\mathbf{A}[\text{constraint\_idx}, -1] \gets -1.0$ \COMMENT{$-z$}
+    \STATE $\mathbf{b}_{\text{lower}}[\text{constraint\_idx}] \gets -\infty$
+    \STATE $\mathbf{b}_{\text{upper}}[\text{constraint\_idx}] \gets 0.0$ \COMMENT{sum $\leq z$}
+    \STATE $\text{constraint\_idx} \gets \text{constraint\_idx} + 1$
+\ENDFOR
+\STATE \COMMENT{Solve MIP}
+\STATE $\text{result} \gets \text{MILP\_Solve}(\mathbf{c}, \mathbf{A}, \mathbf{b}_{\text{lower}}, \mathbf{b}_{\text{upper}}, \text{bounds}, \text{integrality})$
+\STATE \COMMENT{Extract $\mathbf{P}$ from solution}
+\STATE $\mathbf{P}_{\text{flat}} \gets \text{result}.\mathbf{x}[:-1]$ \COMMENT{Exclude $z$}
+\STATE $\mathbf{P} \gets \text{reshape}(\mathbf{P}_{\text{flat}}, (N, N))$
+\STATE $\mathbf{P} \gets \text{round}(\mathbf{P})$ \COMMENT{Ensure binary}
+\RETURN $\mathbf{P}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Cost Matrix Update Subroutine}
+
+\begin{algorithm}[H]
+\caption{Update\_Cost\_Matrix}
+\begin{algorithmic}[1]
+\REQUIRE $\text{evaluated\_pool}$: dictionary of evaluated assignments; $\text{dist\_matrix}$: $(N, N)$ distance matrix
+\ENSURE $\text{cost\_matrix}$: $(N, N)$ updated cost estimates
+\STATE $\text{cost\_counts} \gets \mathbf{0}_{N \times N}$
+\STATE $\text{cost\_matrix}_{\text{updated}} \gets \mathbf{0}_{N \times N}$
+\STATE \COMMENT{Average costs from evaluated assignments}
+\FORALL{$(\text{key}, (\mathbf{P}_{\text{eval}}, \text{costs}_{\text{eval}}, \_)) \in \text{evaluated\_pool}$}
+    \FOR{$i = 1$ \TO $N$}
+        \STATE $j \gets \text{argmax}(\mathbf{P}_{\text{eval}}[i, :])$ \COMMENT{Goal assigned to agent $i$}
+        \IF{$\text{cost\_counts}[i, j] = 0$}
+            \STATE $\text{cost\_matrix}_{\text{updated}}[i, j] \gets \text{costs}_{\text{eval}}[i]$
+        \ELSE
+            \STATE \COMMENT{Running average}
+            \STATE $\text{cost\_matrix}_{\text{updated}}[i, j] \gets \frac{\text{cost\_matrix}_{\text{updated}}[i, j] \times \text{cost\_counts}[i, j] + \text{costs}_{\text{eval}}[i]}{\text{cost\_counts}[i, j] + 1}$
+        \ENDIF
+        \STATE $\text{cost\_counts}[i, j] \gets \text{cost\_counts}[i, j] + 1$
+    \ENDFOR
+\ENDFORALL
+\STATE \COMMENT{Fill unevaluated pairs with distance-based estimates}
+\FOR{$i = 1$ \TO $N$}
+    \FOR{$j = 1$ \TO $N$}
+        \IF{$\text{cost\_counts}[i, j] = 0$}
+            \STATE \COMMENT{Scale distance by average cost/distance ratio from pool}
+            \IF{$\text{evaluated\_pool}$ is not empty}
+                \STATE $\text{ratios} \gets []$
+                \FORALL{$(\_, (\mathbf{P}_{\text{eval}}, \text{costs}_{\text{eval}}, \_)) \in \text{evaluated\_pool}$}
+                    \FOR{$k = 1$ \TO $N$}
+                        \STATE $g_{\text{idx}} \gets \text{argmax}(\mathbf{P}_{\text{eval}}[k, :])$
+                        \STATE $\text{dist}_k \gets \text{dist\_matrix}[k, g_{\text{idx}}]$
+                        \IF{$\text{dist}_k > \epsilon$}
+                            \STATE $\text{ratios}.\text{append}(\text{costs}_{\text{eval}}[k] / \text{dist}_k)$
+                        \ENDIF
+                    \ENDFOR
+                \ENDFORALL
+                \IF{$\text{ratios}$ is not empty}
+                    \STATE $\text{avg\_ratio} \gets \text{mean}(\text{ratios})$
+                    \STATE $\text{cost\_matrix}_{\text{updated}}[i, j] \gets \text{dist\_matrix}[i, j] \times \text{avg\_ratio}$
+                \ELSE
+                    \STATE $\text{cost\_matrix}_{\text{updated}}[i, j] \gets \text{dist\_matrix}[i, j] \times (\text{best\_max\_cost} / \max(\text{dist\_matrix}))$
+                \ENDIF
+            \ELSE
+                \STATE $\text{cost\_matrix}_{\text{updated}}[i, j] \gets \text{dist\_matrix}[i, j]$
+            \ENDIF
+        \ENDIF
+    \ENDFOR
+\ENDFOR
+\RETURN $\text{cost\_matrix}_{\text{updated}}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Game Cost Evaluation Subroutine}
+
+\begin{algorithm}[H]
+\caption{Evaluate\_Game\_Costs}
+\begin{algorithmic}[1]
+\REQUIRE $\mathbf{P}$: $(N, N)$ permutation matrix; $\text{game\_solver}$: game-theoretic solver instance
+\ENSURE $\text{costs}$: $(N,)$ array of total costs per agent
+\STATE \COMMENT{Compute assigned goals}
+\STATE $\hat{\mathbf{g}} \gets \mathbf{P} \mathbf{g}$ \COMMENT{$(N, 2)$}
+\STATE \COMMENT{Update game model with new assignment}
+\STATE $\text{game\_model}[\text{hat\_g}] \gets \hat{\mathbf{g}}$
+\STATE $\text{Rebuild\_Runtime\_Losses}(\text{game\_model}, \hat{\mathbf{g}})$ \COMMENT{Update loss functions}
+\STATE \COMMENT{Temporarily set $\mathbf{P}$ in solver}
+\STATE $\text{game\_solver}.\text{params}[\mathbf{P}] \gets \mathbf{P}$
+\STATE $\text{game\_solver}.\text{params}[\text{assignment\_model}] \gets \text{None}$
+\STATE \COMMENT{Solve game (with reduced iterations for speed)}
+\STATE $\text{original\_num\_iters} \gets \text{game\_solver}.\text{params}[\text{num\_iters}]$
+\STATE $\text{game\_solver}.\text{params}[\text{num\_iters}] \gets 10$
+\STATE $\text{game\_solver}.\text{solve\_game}()$
+\STATE \COMMENT{Extract agent costs}
+\STATE $\mathbf{x}_{\text{traj\_list}} \gets \text{game\_solver}.\text{solution}[\mathbf{x}_{\text{traj\_list}}]$
+\STATE $\mathbf{u}_{\text{traj\_list}} \gets \text{game\_solver}.\text{solution}[\mathbf{u}_{\text{traj\_list}}]$
+\STATE $\text{costs} \gets \text{game\_solver}.\text{compute\_agent\_costs}(\mathbf{x}_{\text{traj\_list}}, \mathbf{u}_{\text{traj\_list}}, \hat{\mathbf{g}})$
+\STATE \COMMENT{Restore original settings}
+\STATE $\text{game\_solver}.\text{params}[\text{num\_iters}] \gets \text{original\_num\_iters}$
+\STATE $\text{game\_solver}.\text{params}.\text{pop}(\mathbf{P}, \text{None})$
+\STATE \COMMENT{Handle failures}
+\IF{$\text{solve failed}$ \OR $\text{costs contains NaN/Inf}$}
+    \RETURN $[10^6, \ldots, 10^6]$ \COMMENT{High penalty}
+\ENDIF
+\RETURN $\text{costs}$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Complexity Summary}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Algorithm} & \textbf{Time Complexity} & \textbf{Space Complexity} & \textbf{Optimality} \\
+\hline
+Greedy & $O(N^2 \log N)$ & $O(N)$ & Heuristic \\
+Hungarian & $O(N^3)$ & $O(N^2)$ & Optimal (total distance) \\
+MIP Fair & $O(\text{iter} \times (N^3 + \text{game\_solve}))$ & $O(N^2)$ & Optimal (minimax) \\
+\hline
+\end{tabular}
+\caption{Complexity comparison of assignment algorithms}
+\end{table}
+
+\section{References}
+
+\begin{enumerate}
+    \item Kuhn, H. W. (1955). ``The Hungarian method for the assignment problem''. \textit{Naval Research Logistics Quarterly}, 2(1-2), 83-97.
+    \item Munkres, J. (1957). ``Algorithms for the Assignment and Transportation Problems''. \textit{Journal of the Society for Industrial and Applied Mathematics}, 5(1), 32-38.
+\end{enumerate}
+
+\end{document}
